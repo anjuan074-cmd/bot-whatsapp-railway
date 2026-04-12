@@ -67,9 +67,6 @@ const db = admin.firestore();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ── Config ─────────────────────────────────────────────────────────────────────
-// Mapa global LID → número de teléfono (WhatsApp multi-device usa @lid internamente)
-const lidToPhone = {};
-
 const CONFIG = {
     PORT:                   process.env.PORT || 3001,
     SESSION_ID:             process.env.SESSION_ID || "default",
@@ -230,22 +227,6 @@ async function iniciarWhatsApp() {
         }
     });
 
-    // Poblar el mapa LID → teléfono cuando WhatsApp sincroniza contactos
-    sock.ev.on("contacts.upsert", (contacts) => {
-        console.log(`[LID-UPSERT] ${contacts.length} contactos recibidos`);
-        for (const contact of contacts) {
-            // DEBUG: ver la estructura real del contacto
-            console.log(`[LID-CONTACT] ${JSON.stringify(contact)}`);
-            if (contact.lid && contact.id) {
-                const lid   = contact.lid.split("@")[0].split(":")[0];
-                const phone = contact.id.split("@")[0].split(":")[0];
-                if (lid && phone) {
-                    lidToPhone[lid] = phone;
-                    console.log(`[LID] mapeado ${lid} → ${phone}`);
-                }
-            }
-        }
-    });
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (type !== "notify") return;
@@ -285,18 +266,14 @@ async function procesarMensajeEntrante(message) {
     let rawPhone = jid.split("@")[0].split(":")[0];
 
     if (jid.endsWith("@lid")) {
-        // DEBUG: volcar la estructura completa del mensaje para ver qué datos hay
-        console.log(`[LID-DEBUG] message.key=${JSON.stringify(message.key)}`);
-        console.log(`[LID-DEBUG] pushName=${message.pushName}`);
-        console.log(`[LID-DEBUG] participant=${message.participant}`);
-        console.log(`[LID-DEBUG] keys=${Object.keys(message)}`);
-        const resolved = lidToPhone[rawPhone];
-        if (!resolved) {
-            console.warn(`[LID] No se pudo resolver ${rawPhone}@lid — ignorando mensaje`);
+        // Baileys expone el JID real en message.key.remoteJidAlt (ej: "573238634992@s.whatsapp.net")
+        const altJid = message.key.remoteJidAlt;
+        if (!altJid) {
+            console.warn(`[LID] Sin remoteJidAlt para ${jid} — ignorando`);
             return;
         }
-        rawPhone = resolved;
-        console.log(`[LID] Resuelto ${jid} → ${rawPhone}`);
+        rawPhone = altJid.split("@")[0].split(":")[0];
+        console.log(`[LID] ${jid} → ${rawPhone}`);
     }
 
     const userPhone = normalizePhone(rawPhone);
