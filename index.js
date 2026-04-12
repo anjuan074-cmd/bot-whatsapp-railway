@@ -252,10 +252,16 @@ async function procesarMensajeEntrante(message) {
     if ((await msgRef.get()).exists) return;
     await msgRef.set({ ts: admin.firestore.FieldValue.serverTimestamp() });
 
-    await guardarMensajeChat(userPhone, message, "in", userName);
+    // Guardamos el mensaje y leemos todos los datos en paralelo — sin esperar uno por uno
+    const [, excusaSnap, cliente, chatDocSnap, configSnap] = await Promise.all([
+        guardarMensajeChat(userPhone, message, "in", userName),
+        db.collection("esperando_excusa").doc(userPhone).get(),
+        obtenerClientePorTelefono(userPhone),
+        db.collection("chats").doc(userPhone).get(),
+        db.collection("settings").doc("bot_config").get(),
+    ]);
 
     // ¿Técnico respondiendo una excusa pendiente?
-    const excusaSnap = await db.collection("esperando_excusa").doc(userPhone).get();
     if (excusaSnap.exists && msgType === "conversation") {
         const dataExcusa = excusaSnap.data();
         const motivo     = message.message.conversation;
@@ -278,10 +284,6 @@ async function procesarMensajeEntrante(message) {
         return;
     }
 
-    const cliente = await obtenerClientePorTelefono(userPhone);
-
-    const chatDocSnap   = await db.collection("chats").doc(userPhone).get();
-    const configSnap    = await db.collection("settings").doc("bot_config").get();
     const isGlobalPause = configSnap.exists && configSnap.data().globalBotPaused === true;
     const isHumanMode   = (chatDocSnap.exists && chatDocSnap.data().humanMode === true) || isGlobalPause;
 
@@ -479,16 +481,18 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
         updateData.unreadCount = admin.firestore.FieldValue.increment(1);
         updateData.status      = "open";
     }
-    await chatRef.set(updateData, { merge: true });
-
     const msgPayload = {
         type:      msgType === "conversation" ? "text" : msgType,
         text:      { body: texto },
         direction,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        ...(message.key?.id && { wamid: message.key.id, ack: direction === "out" ? 1 : undefined }),
+        ...(message.key?.id && { waMessageId: message.key.id, ack: direction === "out" ? 1 : undefined }),
     };
-    await chatRef.collection("messages").add(msgPayload);
+    // Ambas escrituras en paralelo — no dependen la una de la otra
+    await Promise.all([
+        chatRef.set(updateData, { merge: true }),
+        chatRef.collection("messages").add(msgPayload),
+    ]);
 }
 
 function calcularDeudaCliente(cliente) {
@@ -659,12 +663,19 @@ app.get("/qr", auth, async (req, res) => {
 });
 
 // ── POST /enviarMensajeManual ──────────────────────────────────────────────────
+// El frontend (SupportPage) ya guarda el mensaje en Firestore antes de llamar aquí.
+// Solo enviamos por WhatsApp y devolvemos el waMessageId para que el frontend
+// pueda actualizar su doc y recibir ACKs de doble-chulo/chulo azul.
 app.post("/enviarMensajeManual", auth, async (req, res) => {
-    const { telefono, mensaje, nombre } = req.body;
+    const { telefono, mensaje, firestoreMsgId } = req.body;
     if (!telefono || !mensaje) return res.status(400).json({ error: "Faltan datos" });
     const msgId = await enviarTexto(telefono, mensaje);
-    if (msgId) {
-        await guardarMensajeChat(telefono, { message: { conversation: mensaje } }, "out", nombre || "Soporte");
+    // Si el frontend pasó el ID del doc que guardó, lo vinculamos con el waMessageId
+    // para que los ACK receipts (doble chulo / chulo azul) funcionen.
+    if (msgId && firestoreMsgId) {
+        const jid = telefono.replace(/\D/g, "").replace(/^57/, "");
+        db.collection("chats").doc(jid).collection("messages").doc(firestoreMsgId)
+            .update({ waMessageId: msgId }).catch(() => {});
     }
     res.json({ success: !!msgId, msgId });
 });
