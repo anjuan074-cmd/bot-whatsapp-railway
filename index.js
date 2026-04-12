@@ -323,7 +323,7 @@ async function procesarMensajeEntrante(message) {
         }
 
         await excusaSnap.ref.delete();
-        await enviarTexto(userPhone, `✅ He registrado tu justificación en la orden de *${dataExcusa.clienteNombre}*. ¡Gracias!`);
+        await botResponder(userPhone, `✅ He registrado tu justificación en la orden de *${dataExcusa.clienteNombre}*. ¡Gracias!`);
         return;
     }
 
@@ -350,7 +350,7 @@ async function manejarClienteRegistrado(cliente, message) {
     const msgType = Object.keys(message.message || {})[0];
 
     if (["imageMessage", "image"].includes(msgType)) {
-        await enviarTexto(cliente.telefono, "⏳ Procesando tu comprobante...");
+        await botResponder(cliente.telefono, "⏳ Procesando tu comprobante...");
         await procesarPago(message, cliente);
         return;
     }
@@ -367,7 +367,7 @@ async function manejarClienteRegistrado(cliente, message) {
         await db.collection("chats").doc(cliente.telefono).set({
             humanMode: true, unreadCount: admin.firestore.FieldValue.increment(1), sentiment: "urgente",
         }, { merge: true });
-        await enviarTexto(cliente.telefono, `⏳ *Solicitud Recibida*\n\nHe pausado el asistente virtual. Un asesor humano revisará tu caso.`);
+        await botResponder(cliente.telefono, `⏳ *Solicitud Recibida*\n\nHe pausado el asistente virtual. Un asesor humano revisará tu caso.`);
         return;
     }
 
@@ -375,9 +375,9 @@ async function manejarClienteRegistrado(cliente, message) {
         const { totalDebt, monthsStr } = calcularDeudaCliente(cliente);
         if (totalDebt > 0) {
             const fmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(totalDebt);
-            await enviarTexto(cliente.telefono, `🧐 Hola ${cliente.nombre}.\n\nTu saldo pendiente es de: *${fmt}*.\nCorrespondiente a: ${monthsStr}.\n\n👉 Envía la foto del comprobante aquí.`);
+            await botResponder(cliente.telefono, `🧐 Hola ${cliente.nombre}.\n\nTu saldo pendiente es de: *${fmt}*.\nCorrespondiente a: ${monthsStr}.\n\n👉 Envía la foto del comprobante aquí.`);
         } else {
-            await enviarTexto(cliente.telefono, `✅ ¡Estás al día, ${cliente.nombre}! No tienes deudas pendientes.`);
+            await botResponder(cliente.telefono, `✅ ¡Estás al día, ${cliente.nombre}! No tienes deudas pendientes.`);
         }
         return;
     }
@@ -404,9 +404,9 @@ async function manejarClienteRegistrado(cliente, message) {
             `Si no entiendes, redirige a: 💰 "Saldo" | 🛠️ "Falla" | 👨‍💻 "Asesor" | 📸 Foto del comprobante`,
             `Máximo 3 líneas. Solo texto, sin markdown.`,
         ].join("\n"));
-        await enviarTexto(cliente.telefono, result.response.text().trim());
+        await botResponder(cliente.telefono, result.response.text().trim());
     } catch {
-        await enviarTexto(cliente.telefono, `Hola ${cliente.nombre} 👋\n\nEscribe:\n💰 *"Saldo"* - ver deuda\n🛠️ *"Falla"* - soporte técnico\n👨‍💻 *"Asesor"* - hablar con humano\n📸 Foto del comprobante - registrar pago`);
+        await botResponder(cliente.telefono, `Hola ${cliente.nombre} 👋\n\nEscribe:\n💰 *"Saldo"* - ver deuda\n🛠️ *"Falla"* - soporte técnico\n👨‍💻 *"Asesor"* - hablar con humano\n📸 Foto del comprobante - registrar pago`);
     }
 }
 
@@ -418,7 +418,7 @@ async function manejarUsuarioDesconocido(phone, name, message) {
     );
 
     if (!texto) {
-        await enviarTexto(phone, `👋 Hola *${name}*. No tengo este número registrado. Escribe tu *Cédula* para vincularte.`);
+        await botResponder(phone, `👋 Hola *${name}*. No tengo este número registrado. Escribe tu *Cédula* para vincularte.`);
         return;
     }
 
@@ -426,14 +426,14 @@ async function manejarUsuarioDesconocido(phone, name, message) {
     if (cedulaLimpia.length >= 4 && cedulaLimpia.length <= 12) {
         const vinculado = await vincularCliente(cedulaLimpia, phone);
         if (vinculado) {
-            await enviarTexto(phone, `✅ *¡Identidad Verificada!*\n\nHola *${vinculado.nombre}*, vinculé tu WhatsApp.\n\nAhora puedes:\n1️⃣ Enviar foto para pagar\n2️⃣ Escribir "Falla"\n3️⃣ Escribir "Asesor"`);
+            await botResponder(phone, `✅ *¡Identidad Verificada!*\n\nHola *${vinculado.nombre}*, vinculé tu WhatsApp.\n\nAhora puedes:\n1️⃣ Enviar foto para pagar\n2️⃣ Escribir "Falla"\n3️⃣ Escribir "Asesor"`);
         } else {
-            await enviarTexto(phone, `❌ La cédula *${cedulaLimpia}* no está en nuestra base de datos.`);
+            await botResponder(phone, `❌ La cédula *${cedulaLimpia}* no está en nuestra base de datos.`);
         }
         return;
     }
 
-    await enviarTexto(phone, `👋 Bienvenido al Bot del ISP.\n\nNo reconozco este número. Responde *únicamente con tu cédula*.`);
+    await botResponder(phone, `👋 Bienvenido al Bot del ISP.\n\nNo reconozco este número. Responde *únicamente con tu cédula*.`);
 }
 
 async function procesarPago(message, cliente) {
@@ -442,7 +442,7 @@ async function procesarPago(message, cliente) {
             .where("senderPhone", "==", cliente.telefono)
             .where("status", "==", "pending").get();
         if (pendientes.size >= 2) {
-            await enviarTexto(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
+            await botResponder(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
             return;
         }
 
@@ -461,7 +461,7 @@ async function procesarPago(message, cliente) {
         const analisis = await analizarConIA(buffer);
 
         if (!analisis.es_recibo || analisis.confianza < CONFIG.UMBRAL_CONFIANZA) {
-            await enviarTexto(cliente.telefono, "⚠️ No pude leer el comprobante. Intenta con una foto más clara.");
+            await botResponder(cliente.telefono, "⚠️ No pude leer el comprobante. Intenta con una foto más clara.");
             return;
         }
 
@@ -482,10 +482,10 @@ async function procesarPago(message, cliente) {
             senderPhone: cliente.telefono, clientId: cliente.id, status: "pending",
         });
 
-        await enviarTexto(cliente.telefono, mensajeConf);
+        await botResponder(cliente.telefono, mensajeConf);
     } catch (e) {
         console.error("Error procesarPago:", e);
-        await enviarTexto(cliente.telefono, "❌ Error procesando imagen. Un asesor revisará manualmente.");
+        await botResponder(cliente.telefono, "❌ Error procesando imagen. Un asesor revisará manualmente.");
     }
 }
 
@@ -566,7 +566,7 @@ async function crearTicket(cliente, tipo, descripcion) {
         .where("tipo", "==", tipo)
         .where("estado", "==", "abierto").get();
     if (!existing.empty) {
-        await enviarTexto(cliente.telefono, "⚠️ Ya tienes un caso abierto. Estamos trabajando en ello.");
+        await botResponder(cliente.telefono, "⚠️ Ya tienes un caso abierto. Estamos trabajando en ello.");
         return;
     }
     const ref = await db.collection("support_tickets").add({
@@ -576,7 +576,7 @@ async function crearTicket(cliente, tipo, descripcion) {
         prioridad: tipo === "pqr" ? "alta" : "media",
         fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
     });
-    await enviarTexto(cliente.telefono, tipo === "soporte"
+    await botResponder(cliente.telefono, tipo === "soporte"
         ? `🛠️ *Reporte Creado*\nTicket #${ref.id.slice(0,5)}\nTécnicos notificados.`
         : `📝 *PQR Radicada*\nTicket #${ref.id.slice(0,5)}\nEscalado a administración.`
     );
@@ -631,6 +631,14 @@ async function enviarTexto(phone, texto) {
         console.error(`❌ Error enviando a ${jid}:`, err.message);
         return null;
     }
+}
+
+// Envía texto Y guarda en Firestore (para mensajes automáticos del bot)
+async function botResponder(phone, texto) {
+    const msgId = await enviarTexto(phone, texto);
+    const fakeMsg = { message: { conversation: texto }, key: msgId ? { id: msgId } : {} };
+    guardarMensajeChat(phone, fakeMsg, "out", "Bot").catch(() => {});
+    return msgId;
 }
 
 async function enviarImagen(phone, imageSource, caption = "") {
@@ -946,7 +954,7 @@ app.post("/webhookWompi", async (req, res) => {
             });
 
             const valorFmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(transaccion.amount_in_cents / 100);
-            await enviarTexto(cliente.telefono, `✅ *¡Pago Exitoso!*\n\nRecibimos tu pago de *${valorFmt}* (Ref: ${transaccion.reference}).\nServicio al día. ¡Gracias!`);
+            await botResponder(cliente.telefono, `✅ *¡Pago Exitoso!*\n\nRecibimos tu pago de *${valorFmt}* (Ref: ${transaccion.reference}).\nServicio al día. ¡Gracias!`);
         });
 
         res.status(200).send("OK");
