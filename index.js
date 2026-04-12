@@ -179,10 +179,10 @@ async function iniciarWhatsApp() {
     sock = makeWASocket({
         version,
         auth:              state,
-        printQRInTerminal: true,
         browser:           ["ISP Bot", "Chrome", "1.0.0"],
         syncFullHistory:   false,
         markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -205,16 +205,24 @@ async function iniciarWhatsApp() {
         if (connection === "close") {
             isConnected = false;
             const statusCode      = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            const isLoggedOut     = statusCode === DisconnectReason.loggedOut;
+            // 440 = connectionReplaced: otro container tomó la sesión (redeploy Railway).
+            // Esperamos más tiempo para que el nuevo container termine de iniciar.
+            const isReplaced      = statusCode === 440;
 
-            console.warn(`⚠️  Conexión cerrada (código ${statusCode}). Reconectar: ${shouldReconnect}`);
+            console.warn(`⚠️  Conexión cerrada (código ${statusCode}).`);
 
-            if (shouldReconnect) {
-                setTimeout(iniciarWhatsApp, 5000);
-            } else {
-                console.error("🚫 Sesión cerrada. Borrando sesión de Firestore...");
+            if (isLoggedOut) {
+                console.error("🚫 Sesión cerrada por WhatsApp. Borrando sesión de Firestore...");
                 await limpiarSesionFirestore(CONFIG.SESSION_ID);
-                setTimeout(iniciarWhatsApp, 2000);
+                setTimeout(iniciarWhatsApp, 3000);
+            } else if (isReplaced) {
+                // Otro proceso ya tomó la sesión — no reconectar de inmediato para evitar loop
+                console.warn("🔄 Sesión reemplazada por otro proceso. Reconectando en 15s...");
+                setTimeout(iniciarWhatsApp, 15000);
+            } else {
+                // Error de red u otro — reconexión normal
+                setTimeout(iniciarWhatsApp, 5000);
             }
         }
     });
@@ -930,8 +938,31 @@ app.post("/webhookWompi", async (req, res) => {
 // ==========================================
 // ARRANQUE
 // ==========================================
-app.listen(CONFIG.PORT, async () => {
+const server = app.listen(CONFIG.PORT, async () => {
     console.log(`🚀 Servidor Railway corriendo en puerto ${CONFIG.PORT}`);
     console.log(`📱 QR disponible en: /qr`);
     await iniciarWhatsApp();
 });
+
+// Cierre limpio cuando Railway envía SIGTERM (redeploy / stop)
+// Evita que WhatsApp detecte dos sesiones activas (código 440)
+async function shutdown(signal) {
+    console.log(`\n🛑 ${signal} recibido — cerrando conexión de WhatsApp...`);
+    isConnected = false;
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners();
+            await sock.logout().catch(() => {});
+        } catch { /* silencioso */ }
+        sock = null;
+    }
+    server.close(() => {
+        console.log("✅ Servidor HTTP cerrado. Saliendo.");
+        process.exit(0);
+    });
+    // Forzar salida si tarda más de 8 segundos
+    setTimeout(() => process.exit(0), 8000);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
