@@ -67,6 +67,9 @@ const db = admin.firestore();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // ── Config ─────────────────────────────────────────────────────────────────────
+// Mapa global LID → número de teléfono (WhatsApp multi-device usa @lid internamente)
+const lidToPhone = {};
+
 const CONFIG = {
     PORT:                   process.env.PORT || 3001,
     SESSION_ID:             process.env.SESSION_ID || "default",
@@ -227,6 +230,20 @@ async function iniciarWhatsApp() {
         }
     });
 
+    // Poblar el mapa LID → teléfono cuando WhatsApp sincroniza contactos
+    sock.ev.on("contacts.upsert", (contacts) => {
+        for (const contact of contacts) {
+            if (contact.lid && contact.id) {
+                const lid   = contact.lid.split("@")[0].split(":")[0];
+                const phone = contact.id.split("@")[0].split(":")[0];
+                if (lid && phone) {
+                    lidToPhone[lid] = phone;
+                    console.log(`[LID] ${lid} → ${phone}`);
+                }
+            }
+        }
+    });
+
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
         if (type !== "notify") return;
         for (const message of messages) {
@@ -258,12 +275,22 @@ async function iniciarWhatsApp() {
 // ==========================================
 async function procesarMensajeEntrante(message) {
     const jid = message.key.remoteJid;
-    // @g.us = grupos, @lid = Linked ID interno de WhatsApp multi-device (no es teléfono)
-    if (!jid || jid.endsWith("@g.us") || jid.endsWith("@lid")) return;
+    // Ignorar grupos; resolver @lid (Linked Device ID de WhatsApp multi-device) al teléfono real
+    if (!jid || jid.endsWith("@g.us")) return;
 
-    // Baileys multi-device puede dar JIDs como "573001234567:0@s.whatsapp.net".
-    // Splitear en '@' y luego en ':' elimina el sufijo de dispositivo antes de normalizar.
-    const rawPhone  = jid.split("@")[0].split(":")[0];
+    // Baileys multi-device puede dar JIDs como "573001234567:0@s.whatsapp.net" o "24820850884661@lid"
+    let rawPhone = jid.split("@")[0].split(":")[0];
+
+    if (jid.endsWith("@lid")) {
+        const resolved = lidToPhone[rawPhone];
+        if (!resolved) {
+            console.warn(`[LID] No se pudo resolver ${rawPhone}@lid — ignorando mensaje`);
+            return;
+        }
+        rawPhone = resolved;
+        console.log(`[LID] Resuelto ${jid} → ${rawPhone}`);
+    }
+
     const userPhone = normalizePhone(rawPhone);
     console.log(`[MSG] JID=${jid}  raw=${rawPhone}  normalizado=${userPhone}`);
     const userName  = message.pushName || "Usuario";
