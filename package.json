@@ -1,0 +1,20 @@
+{
+  "name": "bot-whatsapp-qr",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp via Baileys — deploy en Railway",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "axios": "^1.13.4",
+    "dotenv": "^17.4.1",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.6.0",
+    "qrcode": "^1.5.4"
+  }
+}
