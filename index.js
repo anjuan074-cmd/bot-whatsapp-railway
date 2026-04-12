@@ -636,8 +636,29 @@ function auth(req, res, next) {
 }
 
 // ── GET /status ────────────────────────────────────────────────────────────────
+// Incluye el QR como data-URL para que el frontend lo muestre directamente (sin iframe).
 app.get("/status", (req, res) => {
-    res.json({ connected: isConnected, number: sock?.user?.id || null, hasQR: !!currentQR });
+    res.json({ connected: isConnected, number: sock?.user?.id || null, hasQR: !!currentQR, qr: currentQR || null });
+});
+
+// ── POST /logout ───────────────────────────────────────────────────────────────
+app.post("/logout", auth, async (_req, res) => {
+    try {
+        if (sock) {
+            try { await sock.logout(); } catch { /* puede fallar si ya estaba desconectado */ }
+            sock.ev.removeAllListeners();
+            sock = null;
+        }
+        isConnected = false;
+        currentQR   = null;
+        await limpiarSesionFirestore(CONFIG.SESSION_ID);
+        // Reconecta limpio para mostrar nuevo QR
+        setTimeout(iniciarWhatsApp, 1500);
+        res.json({ success: true, message: "Sesión cerrada. Escanea el nuevo QR." });
+    } catch (err) {
+        console.error("Error en /logout:", err);
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // ── GET /qr ────────────────────────────────────────────────────────────────────
