@@ -720,7 +720,9 @@ app.post("/enviarCampana", auth, async (req, res) => {
     const textoFinal = mensaje.replace(/\{nombre\}/gi, nombre || "Cliente").trim();
     const msgId      = await enviarTexto(telefono, textoFinal);
     if (!msgId) return res.json({ success: false, reason: "Bot no conectado o número inválido" });
-    await guardarMensajeChat(telefono, { message: { conversation: textoFinal } }, "out", "Campaña");
+    // No llamamos guardarMensajeChat aquí: los mensajes masivos no deben crear
+    // chats en el SupportPage. Un chat solo se crea cuando hay conversación real
+    // (mensaje entrante del cliente o respuesta manual del asesor).
     res.json({ success: true, msgId });
 });
 
