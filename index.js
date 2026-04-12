@@ -160,6 +160,15 @@ function toJID(phone) {
     return `${clean}@s.whatsapp.net`;
 }
 
+// Siempre devuelve 12 dígitos con código de país (ej: 573001234567).
+// Usado como ID de documento en chats/ para evitar duplicados por formato.
+function normalizePhone(phone) {
+    const clean = String(phone).replace(/\D/g, "");
+    if (clean.length === 10 && clean.startsWith("3")) return "57" + clean;
+    if (clean.length === 13 && clean.startsWith("057"))  return clean.slice(1);
+    return clean; // ya está en formato correcto (12 dígitos) o desconocido
+}
+
 // ==========================================
 // INICIALIZACIÓN Y RECONEXIÓN DE WHATSAPP
 // ==========================================
@@ -243,7 +252,7 @@ async function procesarMensajeEntrante(message) {
     const jid = message.key.remoteJid;
     if (!jid || jid.endsWith("@g.us")) return;
 
-    const userPhone = jid.replace("@s.whatsapp.net", "");
+    const userPhone = normalizePhone(jid.replace("@s.whatsapp.net", ""));
     const userName  = message.pushName || "Usuario";
     const msgType   = Object.keys(message.message || {})[0];
 
@@ -450,7 +459,7 @@ async function procesarPago(message, cliente) {
 // FUNCIONES AUXILIARES
 // ==========================================
 async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
-    const chatRef = db.collection("chats").doc(String(telefono));
+    const chatRef = db.collection("chats").doc(normalizePhone(telefono));
     const msgType = Object.keys(message.message || {})[0] || "unknown";
     const texto   = message.message?.conversation
         || message.message?.extendedTextMessage?.text
@@ -539,10 +548,13 @@ async function crearTicket(cliente, tipo, descripcion) {
 }
 
 async function obtenerClientePorTelefono(telefono) {
-    const clean = String(telefono).replace(/\D/g, "");
-    let q = await db.collection("clients").where("telefono", "==", clean).limit(1).get();
-    if (q.empty && clean.startsWith("57"))
-        q = await db.collection("clients").where("telefono", "==", clean.slice(2)).limit(1).get();
+    const clean12 = normalizePhone(telefono);                         // 573001234567
+    const clean10 = clean12.startsWith("57") && clean12.length === 12
+        ? clean12.slice(2) : clean12;                                 // 3001234567
+    // Busca en ambos formatos según cómo esté guardado en la BD
+    let q = await db.collection("clients").where("telefono", "==", clean10).limit(1).get();
+    if (q.empty)
+        q = await db.collection("clients").where("telefono", "==", clean12).limit(1).get();
     return q.empty ? null : { id: q.docs[0].id, ...q.docs[0].data() };
 }
 
