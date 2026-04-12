@@ -232,13 +232,16 @@ async function iniciarWhatsApp() {
 
     // Poblar el mapa LID → teléfono cuando WhatsApp sincroniza contactos
     sock.ev.on("contacts.upsert", (contacts) => {
+        console.log(`[LID-UPSERT] ${contacts.length} contactos recibidos`);
         for (const contact of contacts) {
+            // DEBUG: ver la estructura real del contacto
+            console.log(`[LID-CONTACT] ${JSON.stringify(contact)}`);
             if (contact.lid && contact.id) {
                 const lid   = contact.lid.split("@")[0].split(":")[0];
                 const phone = contact.id.split("@")[0].split(":")[0];
                 if (lid && phone) {
                     lidToPhone[lid] = phone;
-                    console.log(`[LID] ${lid} → ${phone}`);
+                    console.log(`[LID] mapeado ${lid} → ${phone}`);
                 }
             }
         }
@@ -282,6 +285,11 @@ async function procesarMensajeEntrante(message) {
     let rawPhone = jid.split("@")[0].split(":")[0];
 
     if (jid.endsWith("@lid")) {
+        // DEBUG: volcar la estructura completa del mensaje para ver qué datos hay
+        console.log(`[LID-DEBUG] message.key=${JSON.stringify(message.key)}`);
+        console.log(`[LID-DEBUG] pushName=${message.pushName}`);
+        console.log(`[LID-DEBUG] participant=${message.participant}`);
+        console.log(`[LID-DEBUG] keys=${Object.keys(message)}`);
         const resolved = lidToPhone[rawPhone];
         if (!resolved) {
             console.warn(`[LID] No se pudo resolver ${rawPhone}@lid — ignorando mensaje`);
