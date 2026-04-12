@@ -242,9 +242,18 @@ async function iniciarWhatsApp() {
 
     sock.ev.on("message-receipt.update", async (updates) => {
         for (const update of updates) {
-            const jid = normalizePhone(update.key.remoteJid?.split("@")[0].split(":")[0] || "");
+            const remoteJid = update.key.remoteJid || "";
+            let raw = remoteJid.split("@")[0].split(":")[0];
+            // Resolver @lid igual que en procesarMensajeEntrante
+            if (remoteJid.endsWith("@lid")) {
+                const alt = update.key.remoteJidAlt;
+                if (!alt) continue;
+                raw = alt.split("@")[0].split(":")[0];
+            }
+            const jid = normalizePhone(raw);
             const ack = update.receipt.readTimestamp ? 3 : update.receipt.receiptTimestamp ? 2 : 1;
-            if (!jid || !ack) continue;
+            if (!jid) continue;
+            console.log(`[ACK] ${jid} msgId=${update.key.id} ack=${ack}`);
             try {
                 const snap = await db.collection("chats").doc(jid)
                     .collection("messages").where("waMessageId", "==", update.key.id).limit(1).get();
@@ -732,7 +741,7 @@ app.post("/enviarMensajeManual", auth, async (req, res) => {
     // Si el frontend pasó el ID del doc que guardó, lo vinculamos con el waMessageId
     // para que los ACK receipts (doble chulo / chulo azul) funcionen.
     if (msgId && firestoreMsgId) {
-        const jid = telefono.replace(/\D/g, "").replace(/^57/, "");
+        const jid = normalizePhone(telefono);
         db.collection("chats").doc(jid).collection("messages").doc(firestoreMsgId)
             .update({ waMessageId: msgId }).catch(() => {});
     }
