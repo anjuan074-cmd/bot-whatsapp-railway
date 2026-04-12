@@ -250,7 +250,8 @@ async function iniciarWhatsApp() {
 // ==========================================
 async function procesarMensajeEntrante(message) {
     const jid = message.key.remoteJid;
-    if (!jid || jid.endsWith("@g.us")) return;
+    // @g.us = grupos, @lid = Linked ID interno de WhatsApp multi-device (no es teléfono)
+    if (!jid || jid.endsWith("@g.us") || jid.endsWith("@lid")) return;
 
     // Baileys multi-device puede dar JIDs como "573001234567:0@s.whatsapp.net".
     // Splitear en '@' y luego en ':' elimina el sufijo de dispositivo antes de normalizar.
@@ -499,7 +500,8 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
         text:      { body: texto },
         direction,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        ...(message.key?.id && { waMessageId: message.key.id, ack: direction === "out" ? 1 : undefined }),
+        ...(message.key?.id && { waMessageId: message.key.id }),
+        ...(direction === "out" && { ack: 1 }),
     };
     // Ambas escrituras en paralelo — no dependen la una de la otra
     await Promise.all([
