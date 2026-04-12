@@ -233,7 +233,7 @@ async function iniciarWhatsApp() {
 
     sock.ev.on("message-receipt.update", async (updates) => {
         for (const update of updates) {
-            const jid = update.key.remoteJid?.replace("@s.whatsapp.net", "");
+            const jid = normalizePhone(update.key.remoteJid?.split("@")[0].split(":")[0] || "");
             const ack = update.receipt.readTimestamp ? 3 : update.receipt.receiptTimestamp ? 2 : 1;
             if (!jid || !ack) continue;
             try {
@@ -252,7 +252,11 @@ async function procesarMensajeEntrante(message) {
     const jid = message.key.remoteJid;
     if (!jid || jid.endsWith("@g.us")) return;
 
-    const userPhone = normalizePhone(jid.replace("@s.whatsapp.net", ""));
+    // Baileys multi-device puede dar JIDs como "573001234567:0@s.whatsapp.net".
+    // Splitear en '@' y luego en ':' elimina el sufijo de dispositivo antes de normalizar.
+    const rawPhone  = jid.split("@")[0].split(":")[0];
+    const userPhone = normalizePhone(rawPhone);
+    console.log(`[MSG] JID=${jid}  raw=${rawPhone}  normalizado=${userPhone}`);
     const userName  = message.pushName || "Usuario";
     const msgType   = Object.keys(message.message || {})[0];
 
@@ -483,7 +487,7 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
         lastMessage:  texto,
         lastUpdated:  admin.firestore.FieldValue.serverTimestamp(),
         userName:     nombreUsuario || "Cliente",
-        phone:        String(telefono),
+        phone:        normalizePhone(telefono),
         ...(direction === "in" && { sentiment: sentimiento }),
     };
     if (direction === "in") {
