@@ -427,8 +427,9 @@ Responde SOLO con JSON válido sin texto adicional:
 
         case "saldo":
             if (totalDebt > 0) {
+                const nequiSaldo = nequi ? `\n\n📱 *Solo aceptamos pago por Nequi*\nNequi: *${nequi}*\n\n📸 Después de pagar, envía aquí la foto del comprobante de Nequi.` : "\n\n📸 Envía aquí la foto del comprobante de pago.";
                 await botResponder(cliente.telefono,
-                    `${respuestaIA}\n\n💰 Saldo pendiente: *${fmt.format(totalDebt)}*\nCorresponde a: ${monthsStr}\n\n📸 Envía la foto de tu comprobante aquí para registrarlo.`
+                    `${respuestaIA}\n\n💰 Saldo pendiente: *${fmt.format(totalDebt)}*\nCorresponde a: ${monthsStr}${nequiSaldo}`
                 );
             } else {
                 await botResponder(cliente.telefono,
@@ -438,7 +439,9 @@ Responde SOLO con JSON válido sin texto adicional:
             break;
 
         case "pago": {
-            const infoPago = nequi ? `\n\n📱 Nequi: *${nequi}*\n📸 Luego envía la foto del comprobante aquí.` : "\n\n📸 Envía la foto del comprobante aquí.";
+            const infoPago = nequi
+                ? `\n\n✅ *Único método de pago aceptado: Nequi*\n\n📱 Número Nequi: *${nequi}*\n\nPasos:\n1️⃣ Abre Nequi y envía el pago a ese número\n2️⃣ Toma captura del comprobante\n3️⃣ Envíala aquí y quedará registrada automáticamente`
+                : "\n\n📸 Envía la foto del comprobante de pago aquí.";
             await botResponder(cliente.telefono, (respuestaIA || "Para pagar es muy fácil 😊") + infoPago);
             break;
         }
@@ -633,28 +636,57 @@ async function procesarPago(message, cliente) {
         await file.makePublic();
         const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
 
-        const analisis = await analizarConIA(buffer);
+        const nequiConfig  = process.env.CUENTA_NEQUI || "";
+        const analisis     = await analizarConIA(buffer, nequiConfig);
 
-        if (!analisis.es_recibo || analisis.confianza < CONFIG.UMBRAL_CONFIANZA) {
-            await botResponder(cliente.telefono, "⚠️ No pude leer el comprobante. Intenta con una foto más clara.");
+        // ── Validar que sea comprobante de Nequi ──────────────────────────────
+        if (!analisis.es_recibo || !analisis.es_nequi) {
+            const aviso = nequiConfig
+                ? `❌ Solo aceptamos pagos por *Nequi*.\n\n📱 Número Nequi: *${nequiConfig}*\n\nPor favor realiza el pago a ese número y envía la foto del comprobante de Nequi.`
+                : "❌ Solo aceptamos comprobantes de *Nequi*. Envía la foto del comprobante de Nequi.";
+            await botResponder(cliente.telefono, aviso);
             return;
+        }
+
+        if (analisis.confianza < CONFIG.UMBRAL_CONFIANZA) {
+            await botResponder(cliente.telefono, "⚠️ No pude leer bien el comprobante de Nequi. Intenta con una foto más clara y sin recortes.");
+            return;
+        }
+
+        // ── Validar número destinatario coincida con CUENTA_NEQUI ────────────
+        if (nequiConfig && analisis.numero_destino) {
+            const destLimpio   = analisis.numero_destino.replace(/\D/g, "");
+            const nequiLimpio  = nequiConfig.replace(/\D/g, "");
+            if (destLimpio.length >= 7 && nequiLimpio.length >= 7
+                && !destLimpio.includes(nequiLimpio.slice(-7))
+                && !nequiLimpio.includes(destLimpio.slice(-7))) {
+                await botResponder(cliente.telefono,
+                    `❌ El comprobante no corresponde a nuestro Nequi.\n\n📱 El pago debe ser al número: *${nequiConfig}*\n\nRevisa el destinatario y envía el comprobante correcto.`
+                );
+                return;
+            }
         }
 
         const { totalDebt } = calcularDeudaCliente(cliente);
         const valorDetectado = analisis.valor || 0;
-        const valorFmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(valorDetectado);
-        const deudaFmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(totalDebt);
+        const fmt2 = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
+        const valorFmt = fmt2.format(valorDetectado);
+        const deudaFmt = fmt2.format(totalDebt);
+        const refStr   = analisis.referencia ? `\nRef: ${analisis.referencia}` : "";
 
         let mensajeConf = "";
-        if (totalDebt === 0)                mensajeConf = `✅ Recibo de *${valorFmt}* recibido. (Tu saldo ya estaba en $0).`;
-        else if (valorDetectado < totalDebt) mensajeConf = `⚠️ *Abono Parcial*\nRecibo: ${valorFmt}\nDeuda: ${deudaFmt}\nEn revisión.`;
-        else                                mensajeConf = `✅ *Pago Completo*\nRecibo: ${valorFmt}\nCubre tu deuda. Validando.`;
+        if (totalDebt === 0)                mensajeConf = `✅ Comprobante Nequi de *${valorFmt}* recibido.${refStr} (Tu saldo ya estaba en $0).`;
+        else if (valorDetectado < totalDebt) mensajeConf = `⚠️ *Abono Parcial Nequi*\nRecibo: ${valorFmt}\nDeuda: ${deudaFmt}${refStr}\nEn revisión por un asesor.`;
+        else                                mensajeConf = `✅ *Pago Completo vía Nequi*\nRecibo: ${valorFmt}\nCubre tu deuda.${refStr}\nValidando con el equipo.`;
 
         await db.collection("pagos_preaprobados").add({
             senderName: cliente.nombre, extractedAmount: valorDetectado,
             extractedDate: analisis.fecha, currentDebt: totalDebt,
             imageUrl: publicUrl, date: new Date().toISOString(),
             senderPhone: cliente.telefono, clientId: cliente.id, status: "pending",
+            referencia: analisis.referencia || "",
+            numeroDestino: analisis.numero_destino || "",
+            confianza: analisis.confianza,
         });
 
         await botResponder(cliente.telefono, mensajeConf);
@@ -851,16 +883,40 @@ async function vincularClienteAlTelefono(clienteId, telefono) {
     });
 }
 
-async function analizarConIA(buffer) {
+async function analizarConIA(buffer, nequiEsperado = "") {
     try {
         const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
+        const destHint = nequiEsperado
+            ? `El número Nequi del destinatario que esperamos es: ${nequiEsperado}.`
+            : "";
+        const prompt = `Eres un experto en comprobantes de pago colombianos. Analiza esta imagen.
+Busca específicamente comprobantes de la app *Nequi* (Bancolombia):
+- Busca el logo o texto "Nequi" en la imagen.
+- Extrae el monto de la transferencia.
+- Extrae el número de celular destinatario (10 dígitos colombianos).
+- Extrae la referencia o ID de transacción si la hay.
+- Extrae la fecha del comprobante.
+${destHint}
+
+Responde SOLO con JSON sin texto adicional ni bloques de código:
+{"es_recibo":boolean,"es_nequi":boolean,"valor":number,"fecha":"YYYY-MM-DD","numero_destino":"string","referencia":"string","confianza":number}
+
+Donde:
+- es_recibo: true si la imagen parece un comprobante de pago
+- es_nequi: true SOLO si claramente es un comprobante de Nequi
+- valor: monto en pesos colombianos (solo número, sin símbolos)
+- numero_destino: número celular destino de 10 dígitos (solo dígitos, sin espacios ni guiones)
+- confianza: 0-100 qué tan seguro estás de que es un comprobante de Nequi válido`;
+
         const result = await model.generateContent([
-            `Analiza comprobante. Responde SOLO JSON: {"es_recibo":boolean,"valor":number,"fecha":"YYYY-MM-DD","banco":string,"confianza":number}`,
+            prompt,
             { inlineData: { data: buffer.toString("base64"), mimeType: "image/jpeg" } },
         ]);
-        return JSON.parse(result.response.text().replace(/```json|```/gi, "").trim());
+        const raw   = result.response.text().replace(/```json|```/gi, "").trim();
+        const match = raw.match(/\{[\s\S]*\}/);
+        return match ? JSON.parse(match[0]) : { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0 };
     } catch {
-        return { es_recibo: false, valor: 0, fecha: null, confianza: 0 };
+        return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0 };
     }
 }
 
