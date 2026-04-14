@@ -335,8 +335,9 @@ async function procesarMensajeEntrante(message) {
     }
 
     if (!isHumanMode) {
+        const configData = configSnap.exists ? configSnap.data() : {};
         if (!cliente) {
-            await manejarUsuarioDesconocido(userPhone, userName, message);
+            await manejarUsuarioDesconocido(userPhone, userName, message, configData);
         } else {
             await manejarClienteRegistrado(cliente, message);
         }
@@ -410,30 +411,117 @@ async function manejarClienteRegistrado(cliente, message) {
     }
 }
 
-async function manejarUsuarioDesconocido(phone, name, message) {
+async function manejarUsuarioDesconocido(phone, name, message, configData) {
     const texto = (
         message.message?.conversation ||
         message.message?.extendedTextMessage?.text ||
         ""
-    );
+    ).trim();
 
-    if (!texto) {
-        await botResponder(phone, `👋 Hola *${name}*. No tengo este número registrado. Escribe tu *Cédula* para vincularte.`);
+    // Lee qué métodos están habilitados desde la config del bot (ya leída en procesarMensajeEntrante)
+    const metodosHabilitados =
+        (configData?.verificacionMetodos && configData.verificacionMetodos.length > 0)
+            ? configData.verificacionMetodos
+            : ["cedula"];
+    const maxIntentos = configData?.verificacionIntentos || 3;
+
+    const verifRef  = db.collection("verificacion_pendiente").doc(phone);
+    const verifSnap = await verifRef.get();
+
+    // Comprobar si el estado de verificación sigue vigente (expira en 30 min)
+    let estado = null;
+    if (verifSnap.exists) {
+        const d          = verifSnap.data();
+        const expiraEn   = d.expires?.toDate?.();
+        if (expiraEn && expiraEn > new Date()) estado = d;
+        else await verifRef.delete();                       // expirado
+    }
+
+    // ¿Es un saludo o primer mensaje? → reinicia el flujo
+    const esGreeting = !texto || /^(hola|hi|hey|buenas?|buen[ao]s?\s*(d[ií]as?|tardes?|noches?)|saludos?|ola)\b/i.test(texto);
+
+    if (!estado || esGreeting) {
+        const primerMetodo = metodosHabilitados[0];
+        const meta         = METODO_VERIF[primerMetodo] || { pregunta: "Escribe tu cédula." };
+        const expires      = new Date();
+        expires.setMinutes(expires.getMinutes() + 30);
+
+        await verifRef.set({
+            metodoActual:     primerMetodo,
+            metodosRestantes: metodosHabilitados.slice(1),
+            intentos:         0,
+            maxIntentos,
+            expires:          admin.firestore.Timestamp.fromDate(expires),
+        });
+
+        const saludo = esGreeting && texto
+            ? `👋 ¡Hola *${name}*! Soy el asistente virtual.\n\nPara atenderte, necesito verificar tu identidad. 🔐\n\n${meta.pregunta}`
+            : `👋 Hola *${name}*. Este número no está registrado aún.\n\nVamos a verificar tu identidad. 🔐\n\n${meta.pregunta}`;
+
+        await botResponder(phone, saludo);
         return;
     }
 
-    const cedulaLimpia = texto.replace(/\D/g, "");
-    if (cedulaLimpia.length >= 4 && cedulaLimpia.length <= 12) {
-        const vinculado = await vincularCliente(cedulaLimpia, phone);
-        if (vinculado) {
-            await botResponder(phone, `✅ *¡Identidad Verificada!*\n\nHola *${vinculado.nombre}*, vinculé tu WhatsApp.\n\nAhora puedes:\n1️⃣ Enviar foto para pagar\n2️⃣ Escribir "Falla"\n3️⃣ Escribir "Asesor"`);
+    // — Flujo activo de verificación —
+    const { metodoActual, metodosRestantes, intentos } = estado;
+
+    if (!texto) {
+        const meta = METODO_VERIF[metodoActual] || { pregunta: "Responde para continuar." };
+        await botResponder(phone, `Por favor responde con tu *${meta.nombre || metodoActual}*.\n\n${meta.pregunta}`);
+        return;
+    }
+
+    const cliente = await encontrarClientePorMetodo(metodoActual, texto);
+
+    if (cliente) {
+        // ✅ Verificación exitosa
+        await vincularClienteAlTelefono(cliente.id, phone);
+        await verifRef.delete();
+        await botResponder(phone,
+            `✅ *¡Identidad Verificada!*\n\nHola *${cliente.nombre}*, ya vinculé tu WhatsApp a nuestra base de datos. 🎉\n\nAhora puedes:\n1️⃣ 📸 Enviar foto de tu comprobante de pago\n2️⃣ Escribir *"Falla"* para soporte técnico\n3️⃣ Escribir *"Saldo"* para ver tu deuda\n4️⃣ Escribir *"Asesor"* para hablar con alguien`
+        );
+        return;
+    }
+
+    // ❌ Falló este intento
+    const nuevosIntentos = (intentos || 0) + 1;
+
+    if (nuevosIntentos >= maxIntentos) {
+        // Pasar al siguiente método si hay uno disponible
+        if (metodosRestantes && metodosRestantes.length > 0) {
+            const siguienteMetodo = metodosRestantes[0];
+            const meta            = METODO_VERIF[siguienteMetodo] || { pregunta: "Escribe el dato solicitado." };
+            const expires         = new Date();
+            expires.setMinutes(expires.getMinutes() + 30);
+
+            await verifRef.set({
+                metodoActual:     siguienteMetodo,
+                metodosRestantes: metodosRestantes.slice(1),
+                intentos:         0,
+                maxIntentos,
+                expires:          admin.firestore.Timestamp.fromDate(expires),
+            });
+
+            await botResponder(phone,
+                `❌ No encontré coincidencias con ese dato.\n\nProbemos de otra forma:\n\n${meta.pregunta}`
+            );
         } else {
-            await botResponder(phone, `❌ La cédula *${cedulaLimpia}* no está en nuestra base de datos.`);
+            // Sin más métodos disponibles
+            await verifRef.delete();
+            await botResponder(phone,
+                `😔 No pude verificar tu identidad con los datos proporcionados.\n\nEscribe *"Asesor"* para hablar con un humano que pueda ayudarte.`
+            );
         }
         return;
     }
 
-    await botResponder(phone, `👋 Bienvenido al Bot del ISP.\n\nNo reconozco este número. Responde *únicamente con tu cédula*.`);
+    // Intento fallido — quedan más
+    const meta           = METODO_VERIF[metodoActual] || { nombre: metodoActual };
+    const restantes      = maxIntentos - nuevosIntentos;
+    await verifRef.update({ intentos: nuevosIntentos });
+    await botResponder(phone,
+        `❌ No encontré a nadie con ese dato en el sistema.\n\nIntenta de nuevo con tu *${meta.nombre}* (${restantes} intento${restantes !== 1 ? "s" : ""} restante${restantes !== 1 ? "s" : ""}).`
+    );
 }
 
 async function procesarPago(message, cliente) {
@@ -593,13 +681,87 @@ async function obtenerClientePorTelefono(telefono) {
     return q.empty ? null : { id: q.docs[0].id, ...q.docs[0].data() };
 }
 
-async function vincularCliente(cedula, telefono) {
+// ==========================================
+// VERIFICACIÓN MULTI-MÉTODO
+// ==========================================
+
+// Etiquetas legibles para cada método de verificación
+const METODO_VERIF = {
+    cedula:          { nombre: "cédula",                 pregunta: "Por favor escríbeme tu número de *cédula*." },
+    nombre:          { nombre: "nombre completo",         pregunta: "Escríbeme tu *nombre completo* tal como está registrado." },
+    direccion:       { nombre: "dirección",               pregunta: "¿Cuál es tu *dirección de servicio* registrada?" },
+    plan_valor:      { nombre: "valor del plan mensual",  pregunta: "¿Cuánto pagas mensualmente por tu plan? (Solo el número, ej: 45000)" },
+    codigo_cliente:  { nombre: "código de cliente",       pregunta: "Escríbeme tu *código de cliente* (lo encuentras en tu factura)." },
+};
+
+// Normaliza texto: minúsculas, sin tildes, sin espacios extras
+function normalText(str) {
+    return (str || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/\s+/g, " ").trim();
+}
+
+// Busca un cliente en Firestore usando el método y valor dados.
+// Retorna { id, ...data } o null. NO actualiza el teléfono.
+async function encontrarClientePorMetodo(metodo, valor) {
     const ref = db.collection("clients");
-    let q = await ref.where("cedula", "==", String(cedula)).limit(1).get();
-    if (q.empty) q = await ref.where("cedula", "==", Number(cedula)).limit(1).get();
-    if (q.empty) return null;
-    await q.docs[0].ref.update({ telefono, lastLinkDate: admin.firestore.FieldValue.serverTimestamp() });
-    return { id: q.docs[0].id, ...q.docs[0].data() };
+    const v   = (valor || "").trim();
+
+    if (metodo === "cedula") {
+        const num = v.replace(/\D/g, "");
+        if (!num || num.length < 3) return null;
+        let q = await ref.where("cedula", "==", String(num)).limit(1).get();
+        if (q.empty) q = await ref.where("cedula", "==", Number(num)).limit(1).get();
+        return q.empty ? null : { id: q.docs[0].id, ...q.docs[0].data() };
+    }
+
+    if (metodo === "nombre") {
+        const normV = normalText(v);
+        if (normV.length < 3) return null;
+        // Firestore no soporta búsqueda case-insensitive; cargamos hasta 300 docs
+        const snap = await ref.limit(300).get();
+        const hit  = snap.docs.find(d => {
+            const n = normalText(d.data().nombre || "");
+            return n === normV || n.includes(normV) || normV.includes(n.split(" ")[0]);
+        });
+        return hit ? { id: hit.id, ...hit.data() } : null;
+    }
+
+    if (metodo === "direccion") {
+        const normV = normalText(v);
+        if (normV.length < 4) return null;
+        const snap = await ref.limit(300).get();
+        const hit  = snap.docs.find(d => {
+            const dir = normalText(d.data().direccion || "");
+            // Coincide si comparten al menos los primeros 6 caracteres significativos
+            return dir.includes(normV.slice(0, 8)) || normV.includes(dir.slice(0, 8));
+        });
+        return hit ? { id: hit.id, ...hit.data() } : null;
+    }
+
+    if (metodo === "plan_valor") {
+        const num = Number(v.replace(/\D/g, ""));
+        if (!num) return null;
+        const q = await ref.where("pago", "==", num).limit(5).get();
+        // Solo es válido si el resultado es único (evitar ambigüedad)
+        if (q.size === 1) return { id: q.docs[0].id, ...q.docs[0].data() };
+        return null;
+    }
+
+    if (metodo === "codigo_cliente") {
+        const snap = await ref.doc(v).get();
+        return snap.exists ? { id: snap.id, ...snap.data() } : null;
+    }
+
+    return null;
+}
+
+async function vincularClienteAlTelefono(clienteId, telefono) {
+    await db.collection("clients").doc(clienteId).update({
+        telefono,
+        lastLinkDate: admin.firestore.FieldValue.serverTimestamp(),
+    });
 }
 
 async function analizarConIA(buffer) {
