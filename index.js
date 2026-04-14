@@ -350,64 +350,151 @@ async function procesarMensajeEntrante(message) {
 async function manejarClienteRegistrado(cliente, message) {
     const msgType = Object.keys(message.message || {})[0];
 
+    // ── Imagen → procesar comprobante de pago ──────────────────────────────────
     if (["imageMessage", "image"].includes(msgType)) {
         await botResponder(cliente.telefono, "⏳ Procesando tu comprobante...");
         await procesarPago(message, cliente);
         return;
     }
 
-    const texto = (
+    const textoOriginal = (
         message.message?.conversation ||
         message.message?.extendedTextMessage?.text ||
         ""
-    ).toLowerCase().trim();
+    ).trim();
 
-    if (!texto) return;
+    if (!textoOriginal) return;
 
-    if (/(asesor|humano|persona|alguien real|hablar con alguien|ayuda personal)/.test(texto)) {
-        await db.collection("chats").doc(cliente.telefono).set({
-            humanMode: true, unreadCount: admin.firestore.FieldValue.increment(1), sentiment: "urgente",
-        }, { merge: true });
-        await botResponder(cliente.telefono, `⏳ *Solicitud Recibida*\n\nHe pausado el asistente virtual. Un asesor humano revisará tu caso.`);
-        return;
-    }
+    // ── Gemini clasifica la intención y genera respuesta natural ───────────────
+    const { totalDebt, monthsStr } = calcularDeudaCliente(cliente);
+    const empresa  = process.env.NOMBRE_EMPRESA || "el ISP";
+    const nequi    = process.env.CUENTA_NEQUI   || "";
+    const deudaCtx = totalDebt > 0
+        ? `Tiene deuda de $${new Intl.NumberFormat("es-CO").format(totalDebt)} correspondiente a: ${monthsStr}.`
+        : "Está al día con sus pagos.";
 
-    if (/(saldo|deuda|debo|factura|pagar|precio|cuanto)/.test(texto)) {
-        const { totalDebt, monthsStr } = calcularDeudaCliente(cliente);
-        if (totalDebt > 0) {
-            const fmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(totalDebt);
-            await botResponder(cliente.telefono, `🧐 Hola ${cliente.nombre}.\n\nTu saldo pendiente es de: *${fmt}*.\nCorrespondiente a: ${monthsStr}.\n\n👉 Envía la foto del comprobante aquí.`);
-        } else {
-            await botResponder(cliente.telefono, `✅ ¡Estás al día, ${cliente.nombre}! No tienes deudas pendientes.`);
-        }
-        return;
-    }
-
-    if (/(falla|lento|sin internet|no sirve|daño|intermitente|rojo|los led|no carga)/.test(texto)) {
-        await crearTicket(cliente, "soporte", texto);
-        return;
-    }
-
-    if (/(queja|reclamo|pesimo|malo|grosero|demora|denuncia)/.test(texto)) {
-        await crearTicket(cliente, "pqr", texto);
-        return;
-    }
+    let intent     = "otro";
+    let respuestaIA = "";
 
     try {
-        const model = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
-        const { totalDebt, monthsStr } = calcularDeudaCliente(cliente);
-        const deudaInfo = totalDebt > 0
-            ? `Tiene deuda de $${new Intl.NumberFormat("es-CO").format(totalDebt)} en ${monthsStr}.`
-            : "Está al día.";
-        const result = await model.generateContent([
-            `Eres el asistente virtual de un ISP colombiano. Cliente: ${cliente.nombre}. ${deudaInfo}`,
-            `Mensaje: "${texto}"`,
-            `Si no entiendes, redirige a: 💰 "Saldo" | 🛠️ "Falla" | 👨‍💻 "Asesor" | 📸 Foto del comprobante`,
-            `Máximo 3 líneas. Solo texto, sin markdown.`,
-        ].join("\n"));
-        await botResponder(cliente.telefono, result.response.text().trim());
-    } catch {
-        await botResponder(cliente.telefono, `Hola ${cliente.nombre} 👋\n\nEscribe:\n💰 *"Saldo"* - ver deuda\n🛠️ *"Falla"* - soporte técnico\n👨‍💻 *"Asesor"* - hablar con humano\n📸 Foto del comprobante - registrar pago`);
+        const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
+        const result = await model.generateContent(`Eres el asistente virtual de ${empresa}, un proveedor de internet colombiano.
+Cliente: *${cliente.nombre}*. Estado de cuenta: ${deudaCtx}
+
+Mensaje recibido: "${textoOriginal}"
+
+Tu tarea:
+1. Clasifica la intención en UNO de: saludo | saldo | soporte | pqr | asesor | pago | otro
+   - saludo: saludos, preguntas casuales, cómo estás, etc.
+   - saldo: preguntas sobre deuda, factura, cuánto debe, fecha de corte, etc.
+   - soporte: cualquier problema técnico de internet (lento, sin señal, caído, cable robado/cortado, router, luz roja, etc.)
+   - pqr: quejas, reclamos, mala atención, inconformidades, insultos al servicio
+   - asesor: quiere hablar con una persona humana
+   - pago: cómo pagar, métodos de pago, dónde consignar
+   - otro: cualquier otra cosa
+
+2. Genera una respuesta natural, amigable y corta (máximo 3 líneas) en español colombiano.
+   NO uses menús de opciones numerados ni le pidas que escriba palabras específicas.
+   Responde a lo que dijo de forma conversacional.
+
+Responde SOLO con JSON válido sin texto adicional:
+{"intent":"<uno de los valores>","respuesta":"<texto de respuesta>"}`);
+
+        const raw    = result.response.text().replace(/```json|```/gi, "").trim();
+        const match  = raw.match(/\{[\s\S]*\}/);
+        const parsed = match ? JSON.parse(match[0]) : {};
+        intent      = parsed.intent     || "otro";
+        respuestaIA = parsed.respuesta  || "";
+    } catch (err) {
+        console.error("[IA] Error clasificando intención:", err.message);
+    }
+
+    // ── Ejecutar acción según intención ────────────────────────────────────────
+    const fmt = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
+
+    switch (intent) {
+
+        case "asesor":
+            await db.collection("chats").doc(cliente.telefono).set({
+                humanMode: true,
+                unreadCount: admin.firestore.FieldValue.increment(1),
+                sentiment: "urgente",
+            }, { merge: true });
+            await botResponder(cliente.telefono,
+                respuestaIA || `Entendido ${cliente.nombre}, pauso el asistente. Un asesor humano te atenderá pronto. 🙋`
+            );
+            break;
+
+        case "saldo":
+            if (totalDebt > 0) {
+                await botResponder(cliente.telefono,
+                    `${respuestaIA}\n\n💰 Saldo pendiente: *${fmt.format(totalDebt)}*\nCorresponde a: ${monthsStr}\n\n📸 Envía la foto de tu comprobante aquí para registrarlo.`
+                );
+            } else {
+                await botResponder(cliente.telefono,
+                    respuestaIA || `✅ ¡Estás al día, ${cliente.nombre}! No tienes ningún saldo pendiente.`
+                );
+            }
+            break;
+
+        case "pago": {
+            const infoPago = nequi ? `\n\n📱 Nequi: *${nequi}*\n📸 Luego envía la foto del comprobante aquí.` : "\n\n📸 Envía la foto del comprobante aquí.";
+            await botResponder(cliente.telefono, (respuestaIA || "Para pagar es muy fácil 😊") + infoPago);
+            break;
+        }
+
+        case "soporte": {
+            const existente = await db.collection("support_tickets")
+                .where("clienteId", "==", cliente.id)
+                .where("tipo", "==", "soporte")
+                .where("estado", "==", "abierto").get();
+            if (!existente.empty) {
+                await botResponder(cliente.telefono,
+                    `${respuestaIA || "Entiendo, eso es molesto 😞"}\n\nYa tienes un reporte de soporte abierto. Nuestro equipo técnico lo está revisando.`
+                );
+            } else {
+                const ref = await db.collection("support_tickets").add({
+                    clienteId: cliente.id, clienteNombre: cliente.nombre,
+                    clienteTelefono: cliente.telefono, clienteDireccion: cliente.direccion || "",
+                    tipo: "soporte", descripcion: textoOriginal, estado: "abierto",
+                    prioridad: "media", fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                await botResponder(cliente.telefono,
+                    `${respuestaIA || "Entiendo tu situación 🛠️"}\n\nCreé un reporte técnico (ticket #${ref.id.slice(0, 5)}). Un técnico lo revisará y te contactará pronto.`
+                );
+            }
+            break;
+        }
+
+        case "pqr": {
+            const existentePqr = await db.collection("support_tickets")
+                .where("clienteId", "==", cliente.id)
+                .where("tipo", "==", "pqr")
+                .where("estado", "==", "abierto").get();
+            if (!existentePqr.empty) {
+                await botResponder(cliente.telefono,
+                    `${respuestaIA || "Lamento que estés pasando por esto."}\n\nYa tienes un caso de PQR abierto. Lo estamos gestionando.`
+                );
+            } else {
+                const ref = await db.collection("support_tickets").add({
+                    clienteId: cliente.id, clienteNombre: cliente.nombre,
+                    clienteTelefono: cliente.telefono, clienteDireccion: cliente.direccion || "",
+                    tipo: "pqr", descripcion: textoOriginal, estado: "abierto",
+                    prioridad: "alta", fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                await botResponder(cliente.telefono,
+                    `${respuestaIA || "Entiendo tu inconformidad y la tomamos muy en serio."}\n\nRadiqué tu PQR (caso #${ref.id.slice(0, 5)}). La administración lo revisará.`
+                );
+            }
+            break;
+        }
+
+        default:
+            // Saludo o cualquier otro mensaje — la IA ya generó una respuesta natural
+            await botResponder(cliente.telefono,
+                respuestaIA || `Hola ${cliente.nombre} 👋 ¿En qué te puedo ayudar hoy?`
+            );
+            break;
     }
 }
 
