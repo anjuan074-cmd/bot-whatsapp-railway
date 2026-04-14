@@ -295,9 +295,12 @@ async function procesarMensajeEntrante(message) {
     if ((await msgRef.get()).exists) return;
     await msgRef.set({ ts: admin.firestore.FieldValue.serverTimestamp() });
 
+    // Para imágenes guardamos DESPUÉS de subir a Storage (para tener la URL)
+    const isImgMsg = ["imageMessage", "image"].includes(msgType);
+
     // Guardamos el mensaje y leemos todos los datos en paralelo — sin esperar uno por uno
     const [, excusaSnap, cliente, chatDocSnap, configSnap] = await Promise.all([
-        guardarMensajeChat(userPhone, message, "in", userName),
+        isImgMsg ? Promise.resolve() : guardarMensajeChat(userPhone, message, "in", userName),
         db.collection("esperando_excusa").doc(userPhone).get(),
         obtenerClientePorTelefono(userPhone),
         db.collection("chats").doc(userPhone).get(),
@@ -620,6 +623,7 @@ async function procesarPago(message, cliente) {
             .where("senderPhone", "==", cliente.telefono)
             .where("status", "==", "pending").get();
         if (pendientes.size >= 2) {
+            await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre);
             await botResponder(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
             return;
         }
@@ -635,6 +639,9 @@ async function procesarPago(message, cliente) {
         await file.save(buffer, { metadata: { contentType: "image/jpeg" } });
         await file.makePublic();
         const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+        // Guardar el mensaje en el chat CON la URL de la imagen
+        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre, { imageUrl: publicUrl, type: "image" });
 
         const nequiConfig  = process.env.CUENTA_NEQUI || "";
         const analisis     = await analizarConIA(buffer, nequiConfig);
@@ -699,12 +706,18 @@ async function procesarPago(message, cliente) {
 // ==========================================
 // FUNCIONES AUXILIARES
 // ==========================================
-async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
+async function guardarMensajeChat(telefono, message, direction, nombreUsuario, extraFields = {}) {
     const chatRef = db.collection("chats").doc(normalizePhone(telefono));
     const msgType = Object.keys(message.message || {})[0] || "unknown";
+    const caption = message.message?.imageMessage?.caption || message.message?.videoMessage?.caption || "";
     const texto   = message.message?.conversation
         || message.message?.extendedTextMessage?.text
-        || (["imageMessage","image"].includes(msgType) ? "[Imagen]" : "[Archivo]");
+        || caption
+        || (["imageMessage","image"].includes(msgType) ? "[Imagen]"
+          : ["audioMessage","pttMessage"].includes(msgType) ? "[Audio]"
+          : ["videoMessage"].includes(msgType) ? "[Video]"
+          : ["documentMessage"].includes(msgType) ? (message.message?.documentMessage?.fileName || "[Archivo]")
+          : "[Archivo]");
 
     let sentimiento = "neutral";
     if (direction === "in" && typeof texto === "string" && texto.length > 5 && texto !== "[Imagen]") {
@@ -737,6 +750,7 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario) {
         direction,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         ...(message.key?.id && { waMessageId: message.key.id }),
+        ...extraFields,
         ...(direction === "out" && { ack: 1 }),
     };
     // Ambas escrituras en paralelo — no dependen la una de la otra
