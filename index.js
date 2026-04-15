@@ -379,7 +379,7 @@ async function procesarMensajeEntrante(message) {
         if (!cliente) {
             await manejarUsuarioDesconocido(userPhone, userName, message, configData);
         } else {
-            await manejarClienteRegistrado(cliente, message, imageBuffer, imagePublicUrl);
+            await manejarClienteRegistrado(cliente, message, imageBuffer);
         }
     }
 }
@@ -387,13 +387,13 @@ async function procesarMensajeEntrante(message) {
 // ==========================================
 // LÓGICA DE NEGOCIO
 // ==========================================
-async function manejarClienteRegistrado(cliente, message, imageBuffer = null, imagePublicUrl = null) {
+async function manejarClienteRegistrado(cliente, message, imageBuffer = null) {
     const msgType = Object.keys(message.message || {})[0];
 
     // ── Imagen → procesar comprobante de pago ──────────────────────────────────
     if (["imageMessage", "image"].includes(msgType)) {
         await botResponder(cliente.telefono, "⏳ Procesando tu comprobante...");
-        await procesarPago(message, cliente, imageBuffer, imagePublicUrl);
+        await procesarPago(message, cliente, imageBuffer);
         return;
     }
 
@@ -654,42 +654,22 @@ async function manejarUsuarioDesconocido(phone, name, message, configData) {
     );
 }
 
-async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
+async function procesarPago(message, cliente, buffer = null) {
     try {
-        const pendientes = await db.collection("pagos_preaprobados")
-            .where("senderPhone", "==", cliente.telefono)
-            .where("status", "==", "pending").get();
-        if (pendientes.size >= 2) {
-            await botResponder(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
-            return;
-        }
-
-        // Buffer viene del handler principal; subir a pagos/ si no tiene URL aún
         if (!buffer) {
             buffer = await downloadMediaMessage(message, "buffer", {}, {
-                logger: console,
-                reuploadRequest: sock.updateMediaMessage,
+                logger: console, reuploadRequest: sock.updateMediaMessage,
             });
         }
-        if (!publicUrl) {
-            const bucket   = admin.storage().bucket();
-            const fileName = `pagos/${cliente.telefono}_${Date.now()}.jpg`;
-            const file     = bucket.file(fileName);
-            await file.save(buffer, { metadata: { contentType: "image/jpeg" } });
-            await file.makePublic();
-            publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-        }
 
-        // Guardar el mensaje en el chat CON la URL — siempre, sea válido o no
-        // Así el asesor puede ver el comprobante en el chat para aprobarlo
-        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
-            { imageUrl: publicUrl, type: "image" });
+        // ── 1. ANALIZAR CON IA PRIMERO (sin subir nada a Storage todavía) ──────
+        const nequiConfig = process.env.CUENTA_NEQUI || "";
+        const analisis    = await analizarConIA(buffer, nequiConfig);
 
-        const nequiConfig  = process.env.CUENTA_NEQUI || "";
-        const analisis     = await analizarConIA(buffer, nequiConfig);
-
-        // ── Validar que sea comprobante de Nequi ──────────────────────────────
+        // ── 2. VALIDACIONES — guardar solo texto en el chat si no pasa ─────────
         if (!analisis.es_recibo || !analisis.es_nequi) {
+            await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+                { verificationFailed: true, failReason: "not_nequi" });
             const aviso = nequiConfig
                 ? `❌ Solo aceptamos pagos por *Nequi*.\n\n📱 Número Nequi: *${nequiConfig}*\n\nPor favor realiza el pago a ese número y envía la foto del comprobante de Nequi.`
                 : "❌ Solo aceptamos comprobantes de *Nequi*. Envía la foto del comprobante de Nequi.";
@@ -698,17 +678,20 @@ async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
         }
 
         if (analisis.confianza < CONFIG.UMBRAL_CONFIANZA) {
+            await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+                { verificationFailed: true, failReason: "low_confidence" });
             await botResponder(cliente.telefono, "⚠️ No pude leer bien el comprobante de Nequi. Intenta con una foto más clara y sin recortes.");
             return;
         }
 
-        // ── Validar número destinatario coincida con CUENTA_NEQUI ────────────
         if (nequiConfig && analisis.numero_destino) {
-            const destLimpio   = analisis.numero_destino.replace(/\D/g, "");
-            const nequiLimpio  = nequiConfig.replace(/\D/g, "");
+            const destLimpio  = analisis.numero_destino.replace(/\D/g, "");
+            const nequiLimpio = nequiConfig.replace(/\D/g, "");
             if (destLimpio.length >= 7 && nequiLimpio.length >= 7
                 && !destLimpio.includes(nequiLimpio.slice(-7))
                 && !nequiLimpio.includes(destLimpio.slice(-7))) {
+                await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+                    { verificationFailed: true, failReason: "wrong_number" });
                 await botResponder(cliente.telefono,
                     `❌ El comprobante no corresponde a nuestro Nequi.\n\n📱 El pago debe ser al número: *${nequiConfig}*\n\nRevisa el destinatario y envía el comprobante correcto.`
                 );
@@ -716,17 +699,33 @@ async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
             }
         }
 
+        const pendientes = await db.collection("pagos_preaprobados")
+            .where("senderPhone", "==", cliente.telefono)
+            .where("status", "==", "pending").get();
+        if (pendientes.size >= 2) {
+            await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre, {});
+            await botResponder(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
+            return;
+        }
+
+        // ── 3. VÁLIDO — ahora sí subir a Storage y guardar con imageUrl ────────
+        const bucket   = admin.storage().bucket();
+        const fileName = `pagos/${cliente.telefono}_${Date.now()}.jpg`;
+        const file     = bucket.file(fileName);
+        await file.save(buffer, { metadata: { contentType: "image/jpeg" } });
+        await file.makePublic();
+        const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+            { imageUrl: publicUrl, type: "image" });
+
+        // ── 4. Guardar en pagos_preaprobados ────────────────────────────────────
         const { totalDebt } = calcularDeudaCliente(cliente);
         const valorDetectado = analisis.valor || 0;
-        const fmt2 = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
+        const fmt2     = new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 });
         const valorFmt = fmt2.format(valorDetectado);
         const deudaFmt = fmt2.format(totalDebt);
         const refStr   = analisis.referencia ? `\nRef: ${analisis.referencia}` : "";
-
-        let mensajeConf = "";
-        if (totalDebt === 0)                mensajeConf = `✅ Comprobante Nequi de *${valorFmt}* recibido.${refStr} (Tu saldo ya estaba en $0).`;
-        else if (valorDetectado < totalDebt) mensajeConf = `⚠️ *Abono Parcial Nequi*\nRecibo: ${valorFmt}\nDeuda: ${deudaFmt}${refStr}\nEn revisión por un asesor.`;
-        else                                mensajeConf = `✅ *Pago Completo vía Nequi*\nRecibo: ${valorFmt}\nCubre tu deuda.${refStr}\nValidando con el equipo.`;
 
         await db.collection("pagos_preaprobados").add({
             senderName: cliente.nombre, extractedAmount: valorDetectado,
@@ -738,9 +737,15 @@ async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
             confianza: analisis.confianza,
         });
 
+        let mensajeConf = "";
+        if (totalDebt === 0)                mensajeConf = `✅ Comprobante Nequi de *${valorFmt}* recibido.${refStr} (Tu saldo ya estaba en $0).`;
+        else if (valorDetectado < totalDebt) mensajeConf = `⚠️ *Abono Parcial Nequi*\nRecibo: ${valorFmt}\nDeuda: ${deudaFmt}${refStr}\nEn revisión por un asesor.`;
+        else                                mensajeConf = `✅ *Pago Completo vía Nequi*\nRecibo: ${valorFmt}\nCubre tu deuda.${refStr}\nValidando con el equipo.`;
+
         await botResponder(cliente.telefono, mensajeConf);
     } catch (e) {
         console.error("Error procesarPago:", e);
+        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre, {}).catch(() => {});
         await botResponder(cliente.telefono, "❌ Error procesando imagen. Un asesor revisará manualmente.");
     }
 }
