@@ -297,11 +297,21 @@ async function procesarMensajeEntrante(message) {
 
     const isImgMsg = ["imageMessage", "image"].includes(msgType);
 
-    // Para imágenes: descargar y subir a Storage ANTES de guardar en Firestore
-    // así el mensaje queda siempre con imageUrl visible en el chat
+    // Leer estado del chat PRIMERO para saber si es humanMode
+    // (necesario antes de decidir si subir imagen a Storage)
+    const [chatDocSnap, configSnap] = await Promise.all([
+        db.collection("chats").doc(userPhone).get(),
+        db.collection("settings").doc("bot_config").get(),
+    ]);
+    const isGlobalPause = configSnap.exists && configSnap.data().globalBotPaused === true;
+    const isHumanMode   = (chatDocSnap.exists && chatDocSnap.data().humanMode === true) || isGlobalPause;
+
+    // Subir imagen a Storage SOLO si está en modo humano (asesor viendo el chat)
+    // Para comprobantes de pago, procesarPago maneja su propia subida en pagos/
+    // Esto evita llenar Storage con imágenes del bot automático
     let imageBuffer = null;
     let imagePublicUrl = null;
-    if (isImgMsg) {
+    if (isImgMsg && isHumanMode) {
         try {
             imageBuffer = await downloadMediaMessage(message, "buffer", {}, {
                 logger: console,
@@ -318,16 +328,14 @@ async function procesarMensajeEntrante(message) {
         }
     }
 
-    // Guardamos el mensaje y leemos todos los datos en paralelo
-    const [, excusaSnap, cliente, chatDocSnap, configSnap] = await Promise.all([
+    // Guardamos el mensaje y leemos el resto de datos en paralelo
+    const [, excusaSnap, cliente] = await Promise.all([
         isImgMsg
             ? guardarMensajeChat(userPhone, message, "in", userName,
                 imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" } : {})
             : guardarMensajeChat(userPhone, message, "in", userName),
         db.collection("esperando_excusa").doc(userPhone).get(),
         obtenerClientePorTelefono(userPhone),
-        db.collection("chats").doc(userPhone).get(),
-        db.collection("settings").doc("bot_config").get(),
     ]);
 
     // ¿Técnico respondiendo una excusa pendiente?
@@ -352,9 +360,6 @@ async function procesarMensajeEntrante(message) {
         await botResponder(userPhone, `✅ He registrado tu justificación en la orden de *${dataExcusa.clienteNombre}*. ¡Gracias!`);
         return;
     }
-
-    const isGlobalPause = configSnap.exists && configSnap.data().globalBotPaused === true;
-    const isHumanMode   = (chatDocSnap.exists && chatDocSnap.data().humanMode === true) || isGlobalPause;
 
     if (isGlobalPause && !(chatDocSnap.exists && chatDocSnap.data().humanMode)) {
         await db.collection("chats").doc(userPhone).set({ humanMode: true }, { merge: true });
