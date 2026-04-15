@@ -306,34 +306,43 @@ async function procesarMensajeEntrante(message) {
     const isGlobalPause = configSnap.exists && configSnap.data().globalBotPaused === true;
     const isHumanMode   = (chatDocSnap.exists && chatDocSnap.data().humanMode === true) || isGlobalPause;
 
-    // Subir imagen a Storage SOLO si está en modo humano (asesor viendo el chat)
-    // Para comprobantes de pago, procesarPago maneja su propia subida en pagos/
-    // Esto evita llenar Storage con imágenes del bot automático
+    // Siempre descargar buffer de imagen para poder procesarla
+    // humanMode  → subir a chat/  y guardar mensaje con URL ahora
+    // bot mode   → NO guardar mensaje aún; procesarPago sube a pagos/ y guarda con esa URL
     let imageBuffer = null;
     let imagePublicUrl = null;
-    if (isImgMsg && isHumanMode) {
+    if (isImgMsg) {
         try {
             imageBuffer = await downloadMediaMessage(message, "buffer", {}, {
                 logger: console,
                 reuploadRequest: sock.updateMediaMessage,
             });
-            const bucket   = admin.storage().bucket();
-            const fileName = `chat/${userPhone}_${Date.now()}.jpg`;
-            const file     = bucket.file(fileName);
-            await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
-            await file.makePublic();
-            imagePublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
         } catch (e) {
-            console.error("[IMG] Error subiendo imagen:", e.message);
+            console.error("[IMG] Error descargando imagen:", e.message);
+        }
+
+        if (isHumanMode && imageBuffer) {
+            try {
+                const bucket   = admin.storage().bucket();
+                const fileName = `chat/${userPhone}_${Date.now()}.jpg`;
+                const file     = bucket.file(fileName);
+                await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
+                await file.makePublic();
+                imagePublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+            } catch (e) {
+                console.error("[IMG] Error subiendo imagen a chat/:", e.message);
+            }
         }
     }
 
-    // Guardamos el mensaje y leemos el resto de datos en paralelo
+    // humanMode  → guardar mensaje ahora (con URL si se pudo subir)
+    // bot + img  → posponer; procesarPago guardará el mensaje con imageUrl de pagos/
+    // texto/otro → guardar ahora
     const [, excusaSnap, cliente] = await Promise.all([
-        isImgMsg
-            ? guardarMensajeChat(userPhone, message, "in", userName,
-                imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" } : {})
-            : guardarMensajeChat(userPhone, message, "in", userName),
+        (isImgMsg && !isHumanMode)
+            ? Promise.resolve()
+            : guardarMensajeChat(userPhone, message, "in", userName,
+                imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" } : {}),
         db.collection("esperando_excusa").doc(userPhone).get(),
         obtenerClientePorTelefono(userPhone),
     ]);
@@ -655,7 +664,7 @@ async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
             return;
         }
 
-        // El buffer y URL ya vienen del handler principal (no descargar/subir de nuevo)
+        // Buffer viene del handler principal; subir a pagos/ si no tiene URL aún
         if (!buffer) {
             buffer = await downloadMediaMessage(message, "buffer", {}, {
                 logger: console,
@@ -670,6 +679,11 @@ async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
             await file.makePublic();
             publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
         }
+
+        // Guardar el mensaje en el chat CON la URL — siempre, sea válido o no
+        // Así el asesor puede ver el comprobante en el chat para aprobarlo
+        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+            { imageUrl: publicUrl, type: "image" });
 
         const nequiConfig  = process.env.CUENTA_NEQUI || "";
         const analisis     = await analizarConIA(buffer, nequiConfig);
