@@ -1214,6 +1214,45 @@ app.post("/enviarMensajeManual", auth, async (req, res) => {
     res.json({ success: !!msgId, msgId });
 });
 
+// ── POST /confirmarPago ────────────────────────────────────────────────────────
+// Envía el comprobante de pago al cliente como confirmación de aprobación.
+// Recibe: { telefono, imageUrl, caption, nombreCliente }
+app.post("/confirmarPago", auth, async (req, res) => {
+    const { telefono, imageUrl, caption, nombreCliente } = req.body;
+    if (!telefono || !imageUrl) return res.status(400).json({ error: "Faltan datos" });
+
+    const texto = caption || `✅ *Pago aprobado*\n\nHola ${nombreCliente || ""}, tu comprobante fue verificado y el pago ha sido registrado correctamente. ¡Gracias! 🙏`;
+
+    // 1. Enviar imagen con caption por WhatsApp
+    const msgId = await enviarImagen(telefono, imageUrl, texto);
+
+    // 2. Guardar en Firestore (mensaje saliente con la imagen)
+    const jid = normalizePhone(telefono);
+    const chatRef = db.collection("chats").doc(jid);
+    const fakeMsg = { message: {}, key: msgId ? { id: msgId } : {} };
+    const msgPayload = {
+        type: "image",
+        text: { body: texto },
+        imageUrl,
+        mediaUrl: imageUrl,
+        direction: "out",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        ack: 1,
+        ...(msgId && { waMessageId: msgId }),
+    };
+    await Promise.all([
+        chatRef.set({
+            lastMessage: "📷 Comprobante aprobado",
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            ...(nombreCliente && { userName: nombreCliente }),
+            phone: jid,
+        }, { merge: true }),
+        chatRef.collection("messages").add(msgPayload),
+    ]);
+
+    res.json({ success: !!msgId, msgId });
+});
+
 // ── POST /enviarCampana ────────────────────────────────────────────────────────
 app.post("/enviarCampana", auth, async (req, res) => {
     const { telefono, nombre, mensaje } = req.body;
