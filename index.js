@@ -728,19 +728,27 @@ async function procesarPago(message, cliente, buffer = null) {
             return;
         }
 
-        if (nequiConfig && analisis.numero_destino) {
-            const destLimpio  = analisis.numero_destino.replace(/\D/g, "");
-            const nequiLimpio = nequiConfig.replace(/\D/g, "");
-            if (destLimpio.length >= 7 && nequiLimpio.length >= 7
-                && !destLimpio.includes(nequiLimpio.slice(-7))
-                && !nequiLimpio.includes(destLimpio.slice(-7))) {
+        if (nequiConfig) {
+            if (analisis.numero_correcto === false) {
+                // Gemini confirmó que el número del destinatario NO coincide
+                const destVisual = analisis.numero_destino ? ` (detectado: ${analisis.numero_destino})` : "";
                 await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
                     { verificationFailed: true, failReason: "wrong_number" });
                 await botResponder(cliente.telefono,
-                    `❌ El comprobante no corresponde a nuestro Nequi.\n\n📱 El pago debe ser al número: *${nequiConfig}*\n\nRevisa el destinatario y envía el comprobante correcto.`
+                    `❌ El comprobante no corresponde a nuestro Nequi.${destVisual}\n\n📱 El pago debe ser al número: *${nequiConfig}*\n\nRevisa el destinatario y envía el comprobante correcto.`
                 );
                 return;
             }
+            if (analisis.numero_correcto === null) {
+                // No se pudo verificar el número del destinatario → rechazar por seguridad
+                await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre,
+                    { verificationFailed: true, failReason: "unverifiable_number" });
+                await botResponder(cliente.telefono,
+                    `⚠️ No pude leer el número del destinatario en el comprobante.\n\nAsegúrate de que la foto muestre claramente el número al que se envió el dinero y que sea al: *${nequiConfig}*`
+                );
+                return;
+            }
+            // numero_correcto === true → continuar
         }
 
         const pendientes = await db.collection("pagos_preaprobados")
@@ -991,27 +999,39 @@ async function vincularClienteAlTelefono(clienteId, telefono) {
 async function analizarConIA(buffer, nequiEsperado = "") {
     try {
         const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
-        const destHint = nequiEsperado
-            ? `El número Nequi del destinatario que esperamos es: ${nequiEsperado}.`
-            : "";
-        const prompt = `Eres un experto en comprobantes de pago colombianos. Analiza esta imagen.
-Busca específicamente comprobantes de la app *Nequi* (Bancolombia):
-- Busca el logo o texto "Nequi" en la imagen.
-- Extrae el monto de la transferencia.
-- Extrae el número de celular destinatario (10 dígitos colombianos).
-- Extrae la referencia o ID de transacción si la hay.
-- Extrae la fecha del comprobante.
-${destHint}
+
+        const verifyBlock = nequiEsperado ? `
+VERIFICACIÓN DEL DESTINATARIO (MUY IMPORTANTE):
+El número Nequi al que DEBE estar dirigido el pago es: ${nequiEsperado}
+Busca en la imagen el campo del DESTINATARIO/RECEPTOR (etiquetas como "Para:", "Transferiste a:", "Enviaste a:", "Destinatario:", "Número Nequi destino", o el número celular que aparece como receptor).
+- Si encuentras el número del destinatario Y coincide con ${nequiEsperado} → numero_correcto: true
+- Si encuentras el número del destinatario Y NO coincide con ${nequiEsperado} → numero_correcto: false
+- Si el comprobante NO muestra claramente el número del destinatario → numero_correcto: null` : "";
+
+        const prompt = `Eres un experto en comprobantes de pago colombianos. Analiza esta imagen con máxima precisión.
+
+PASO 1 — Identifica si es un comprobante Nequi:
+- Busca el logo morado de Nequi o el texto "Nequi" en la imagen.
+- Solo es_nequi=true si hay evidencia clara de la marca Nequi.
+- NO confundas con otros medios de pago (Daviplata, PSE, transferencia bancaria, etc.).
+
+PASO 2 — Extrae los datos del comprobante:
+- valor: monto transferido en pesos colombianos (número entero, sin símbolos).
+- fecha: fecha de la transacción en formato YYYY-MM-DD.
+- numero_destino: número celular del RECEPTOR/DESTINATARIO (10 dígitos, solo números, sin espacios). Busca específicamente el número al que se envió el dinero, NO el del remitente.
+- referencia: ID, código o referencia de la transacción si aparece.
+${verifyBlock}
 
 Responde SOLO con JSON sin texto adicional ni bloques de código:
-{"es_recibo":boolean,"es_nequi":boolean,"valor":number,"fecha":"YYYY-MM-DD","numero_destino":"string","referencia":"string","confianza":number}
+{"es_recibo":boolean,"es_nequi":boolean,"valor":number,"fecha":"YYYY-MM-DD","numero_destino":"string","referencia":"string","confianza":number,"numero_correcto":boolean|null}
 
 Donde:
-- es_recibo: true si la imagen parece un comprobante de pago
-- es_nequi: true SOLO si claramente es un comprobante de Nequi
-- valor: monto en pesos colombianos (solo número, sin símbolos)
-- numero_destino: número celular destino de 10 dígitos (solo dígitos, sin espacios ni guiones)
-- confianza: 0-100 qué tan seguro estás de que es un comprobante de Nequi válido`;
+- es_recibo: true si la imagen es un comprobante de pago (cualquier tipo)
+- es_nequi: true SOLO si claramente es Nequi
+- valor: monto (0 si no se lee)
+- numero_destino: número del receptor (vacío "" si no se puede leer)
+- confianza: 0-100, certeza de que es un comprobante Nequi válido y legible
+- numero_correcto: true/false/null según la verificación de destinatario (null si no aplica o no se puede leer)`;
 
         const result = await model.generateContent([
             prompt,
@@ -1019,9 +1039,22 @@ Donde:
         ]);
         const raw   = result.response.text().replace(/```json|```/gi, "").trim();
         const match = raw.match(/\{[\s\S]*\}/);
-        return match ? JSON.parse(match[0]) : { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0 };
+        const parsed = match ? JSON.parse(match[0]) : null;
+        if (!parsed) return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
+        // Fallback: si no vino numero_correcto pero hay número, comparar manualmente
+        if (parsed.numero_correcto === undefined) {
+            parsed.numero_correcto = null;
+            if (nequiEsperado && parsed.numero_destino) {
+                const d = parsed.numero_destino.replace(/\D/g, "");
+                const n = nequiEsperado.replace(/\D/g, "");
+                if (d.length >= 7 && n.length >= 7) {
+                    parsed.numero_correcto = d.includes(n.slice(-7)) || n.includes(d.slice(-7));
+                }
+            }
+        }
+        return parsed;
     } catch {
-        return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0 };
+        return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
     }
 }
 
