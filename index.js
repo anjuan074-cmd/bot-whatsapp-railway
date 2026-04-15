@@ -77,6 +77,23 @@ const CONFIG = {
     UMBRAL_CONFIANZA:       55,
 };
 
+// ── Caché Nequi (evita leer Firestore en cada mensaje) ─────────────────────────
+let _nequiCache = { value: null, ts: 0 };
+async function getCuentaNequi() {
+    const now = Date.now();
+    if (_nequiCache.value !== null && now - _nequiCache.ts < 5 * 60 * 1000) {
+        return _nequiCache.value;
+    }
+    try {
+        const snap = await db.collection("settings").doc("bot_config").get();
+        const val  = snap.exists ? (snap.data().cuentaNequi || "") : (process.env.CUENTA_NEQUI || "");
+        _nequiCache = { value: val, ts: now };
+        return val;
+    } catch {
+        return process.env.CUENTA_NEQUI || "";
+    }
+}
+
 // ==========================================
 // SESIÓN WHATSAPP EN FIRESTORE
 // ==========================================
@@ -261,6 +278,33 @@ async function iniciarWhatsApp() {
             } catch { /* no crítico */ }
         }
     });
+
+    // messages.update: Baileys dispara este evento cuando cambia el estado (ack)
+    // de los mensajes ENVIADOS por nosotros (enviados → entregado → leído).
+    sock.ev.on("messages.update", async (updates) => {
+        for (const update of updates) {
+            if (!update.key.fromMe) continue; // solo nuestros mensajes salientes
+            const status = update.update?.status;
+            if (!status) continue;
+            // proto.WebMessageInfo.Status: SERVER_ACK=1, DELIVERY_ACK=2, READ=3, PLAYED=4
+            const ack = status >= 3 ? 3 : status >= 2 ? 2 : 1;
+            const remoteJid = update.key.remoteJid || "";
+            let raw = remoteJid.split("@")[0].split(":")[0];
+            if (remoteJid.endsWith("@lid")) {
+                const alt = update.key.remoteJidAlt;
+                if (!alt) continue;
+                raw = alt.split("@")[0].split(":")[0];
+            }
+            const jid = normalizePhone(raw);
+            if (!jid) continue;
+            console.log(`[MSG-UPDATE] ${jid} msgId=${update.key.id} status=${status} ack=${ack}`);
+            try {
+                const snap = await db.collection("chats").doc(jid)
+                    .collection("messages").where("waMessageId", "==", update.key.id).limit(1).get();
+                if (!snap.empty) await snap.docs[0].ref.update({ ack });
+            } catch { /* no crítico */ }
+        }
+    });
 }
 
 // ==========================================
@@ -408,7 +452,7 @@ async function manejarClienteRegistrado(cliente, message, imageBuffer = null) {
     // ── Gemini clasifica la intención y genera respuesta natural ───────────────
     const { totalDebt, monthsStr } = calcularDeudaCliente(cliente);
     const empresa  = process.env.NOMBRE_EMPRESA || "el ISP";
-    const nequi    = process.env.CUENTA_NEQUI   || "";
+    const nequi    = await getCuentaNequi();
     const deudaCtx = totalDebt > 0
         ? `Tiene deuda de $${new Intl.NumberFormat("es-CO").format(totalDebt)} correspondiente a: ${monthsStr}.`
         : "Está al día con sus pagos.";
@@ -663,7 +707,7 @@ async function procesarPago(message, cliente, buffer = null) {
         }
 
         // ── 1. ANALIZAR CON IA PRIMERO (sin subir nada a Storage todavía) ──────
-        const nequiConfig = process.env.CUENTA_NEQUI || "";
+        const nequiConfig = await getCuentaNequi();
         const analisis    = await analizarConIA(buffer, nequiConfig);
 
         // ── 2. VALIDACIONES — guardar solo texto en el chat si no pasa ─────────
