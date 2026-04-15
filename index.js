@@ -783,13 +783,21 @@ async function procesarPago(message, cliente, buffer = null) {
         const refStr   = analisis.referencia ? `\nRef: ${analisis.referencia}` : "";
 
         await db.collection("pagos_preaprobados").add({
-            senderName: cliente.nombre, extractedAmount: valorDetectado,
-            extractedDate: analisis.fecha, currentDebt: totalDebt,
-            imageUrl: publicUrl, date: new Date().toISOString(),
-            senderPhone: cliente.telefono, clientId: cliente.id, status: "pending",
-            referencia: analisis.referencia || "",
-            numeroDestino: analisis.numero_destino || "",
-            confianza: analisis.confianza,
+            senderName:      cliente.nombre,
+            extractedAmount: valorDetectado,
+            extractedDate:   analisis.fecha,
+            extractedHora:   analisis.hora || "",
+            currentDebt:     totalDebt,
+            imageUrl:        publicUrl,
+            date:            new Date().toISOString(),
+            senderPhone:     cliente.telefono,
+            clientId:        cliente.id,
+            status:          "pending",
+            referencia:      analisis.referencia || "",
+            numeroDestino:   analisis.numero_destino || "",
+            bancoOrigen:     analisis.banco_origen || "Desconocido",
+            nombreRemitente: analisis.nombre_remitente || "",
+            confianza:       analisis.confianza,
         });
 
         let mensajeConf = "";
@@ -1012,12 +1020,12 @@ Puede aparecer como: "Para:", "Transferiste a:", "Enviaste a:", "Destinatario:",
 - Si lo encuentras Y NO coincide con ${nequiEsperado} → numero_correcto: false
 - Si el comprobante no muestra claramente el destinatario → numero_correcto: null` : "";
 
-        const prompt = `Eres un experto en comprobantes de transferencias y pagos colombianos. Analiza esta imagen.
+        const prompt = `Eres un experto en comprobantes de transferencias y pagos colombianos. Analiza esta imagen con máxima precisión.
 
-TIPOS DE COMPROBANTE ACEPTADOS (cualquiera es válido si el destinatario es correcto):
+TIPOS DE COMPROBANTE ACEPTADOS:
 - Nequi (app morada de Bancolombia)
 - Bre-B / Breb (sistema de pagos instantáneos del Banco de la República, opera entre todos los bancos colombianos)
-- Transferencia bancaria desde cualquier banco colombiano (Bancolombia, Davivienda, BBVA, Banco de Bogotá, Falabella, etc.)
+- Transferencia bancaria desde cualquier banco colombiano (Bancolombia, Davivienda, BBVA, Banco de Bogotá, Falabella, Itaú, etc.)
 - Daviplata
 - PSE
 - Cualquier otro medio de pago colombiano
@@ -1026,16 +1034,19 @@ PASO 1 — ¿Es un comprobante de pago/transferencia?
 - es_recibo: true si la imagen muestra evidencia de una transferencia o pago realizado.
 - es_nequi: true SOLO si hay logo o texto "Nequi" visible. Para Bre-B u otros bancos es false.
 
-PASO 2 — Extrae los datos:
+PASO 2 — Extrae TODOS los datos del comprobante:
 - valor: monto en pesos colombianos (número entero sin símbolos, 0 si no se lee).
 - fecha: fecha de la transacción en formato YYYY-MM-DD.
+- hora: hora de la transacción en formato HH:MM (24h), cadena vacía si no aparece.
+- banco_origen: nombre del banco o app desde donde se hizo el pago. Ejemplos: "Nequi", "Bancolombia", "Daviplata", "Davivienda", "BBVA", "Banco de Bogotá", "Bre-B", "Falabella", "Itaú", etc. Si no se identifica, devuelve "Desconocido".
+- nombre_remitente: nombre completo de quien ENVIÓ el dinero, tal como aparece en el comprobante (campo "De:", "Remitente:", "Nombre:", o el nombre que aparece asociado al pagador). Cadena vacía si no aparece.
 - numero_destino: número celular o llave del RECEPTOR/DESTINATARIO (solo dígitos, sin espacios). NO el del remitente.
 - referencia: ID, código o referencia de la transacción.
 - confianza: 0-100, qué tan seguro estás de que es un comprobante real y legible.
 ${verifyBlock}
 
 Responde SOLO con JSON sin texto adicional ni bloques de código:
-{"es_recibo":boolean,"es_nequi":boolean,"valor":number,"fecha":"YYYY-MM-DD","numero_destino":"string","referencia":"string","confianza":number,"numero_correcto":boolean|null}`;
+{"es_recibo":boolean,"es_nequi":boolean,"valor":number,"fecha":"YYYY-MM-DD","hora":"HH:MM","banco_origen":"string","nombre_remitente":"string","numero_destino":"string","referencia":"string","confianza":number,"numero_correcto":boolean|null}`;
 
         const result = await model.generateContent([
             prompt,
@@ -1044,7 +1055,7 @@ Responde SOLO con JSON sin texto adicional ni bloques de código:
         const raw   = result.response.text().replace(/```json|```/gi, "").trim();
         const match = raw.match(/\{[\s\S]*\}/);
         const parsed = match ? JSON.parse(match[0]) : null;
-        if (!parsed) return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
+        if (!parsed) return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, hora: "", banco_origen: "Desconocido", nombre_remitente: "", numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
         // Fallback: si Gemini no devolvió numero_correcto, comparar manualmente
         if (parsed.numero_correcto === undefined || parsed.numero_correcto === null) {
             parsed.numero_correcto = null;
@@ -1058,7 +1069,7 @@ Responde SOLO con JSON sin texto adicional ni bloques de código:
         }
         return parsed;
     } catch {
-        return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
+        return { es_recibo: false, es_nequi: false, valor: 0, fecha: null, hora: "", banco_origen: "Desconocido", nombre_remitente: "", numero_destino: "", referencia: "", confianza: 0, numero_correcto: null };
     }
 }
 
