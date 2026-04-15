@@ -295,12 +295,35 @@ async function procesarMensajeEntrante(message) {
     if ((await msgRef.get()).exists) return;
     await msgRef.set({ ts: admin.firestore.FieldValue.serverTimestamp() });
 
-    // Para imágenes guardamos DESPUÉS de subir a Storage (para tener la URL)
     const isImgMsg = ["imageMessage", "image"].includes(msgType);
 
-    // Guardamos el mensaje y leemos todos los datos en paralelo — sin esperar uno por uno
+    // Para imágenes: descargar y subir a Storage ANTES de guardar en Firestore
+    // así el mensaje queda siempre con imageUrl visible en el chat
+    let imageBuffer = null;
+    let imagePublicUrl = null;
+    if (isImgMsg) {
+        try {
+            imageBuffer = await downloadMediaMessage(message, "buffer", {}, {
+                logger: console,
+                reuploadRequest: sock.updateMediaMessage,
+            });
+            const bucket   = admin.storage().bucket();
+            const fileName = `chat/${userPhone}_${Date.now()}.jpg`;
+            const file     = bucket.file(fileName);
+            await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
+            await file.makePublic();
+            imagePublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        } catch (e) {
+            console.error("[IMG] Error subiendo imagen:", e.message);
+        }
+    }
+
+    // Guardamos el mensaje y leemos todos los datos en paralelo
     const [, excusaSnap, cliente, chatDocSnap, configSnap] = await Promise.all([
-        isImgMsg ? Promise.resolve() : guardarMensajeChat(userPhone, message, "in", userName),
+        isImgMsg
+            ? guardarMensajeChat(userPhone, message, "in", userName,
+                imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" } : {})
+            : guardarMensajeChat(userPhone, message, "in", userName),
         db.collection("esperando_excusa").doc(userPhone).get(),
         obtenerClientePorTelefono(userPhone),
         db.collection("chats").doc(userPhone).get(),
@@ -342,7 +365,7 @@ async function procesarMensajeEntrante(message) {
         if (!cliente) {
             await manejarUsuarioDesconocido(userPhone, userName, message, configData);
         } else {
-            await manejarClienteRegistrado(cliente, message);
+            await manejarClienteRegistrado(cliente, message, imageBuffer, imagePublicUrl);
         }
     }
 }
@@ -350,13 +373,13 @@ async function procesarMensajeEntrante(message) {
 // ==========================================
 // LÓGICA DE NEGOCIO
 // ==========================================
-async function manejarClienteRegistrado(cliente, message) {
+async function manejarClienteRegistrado(cliente, message, imageBuffer = null, imagePublicUrl = null) {
     const msgType = Object.keys(message.message || {})[0];
 
     // ── Imagen → procesar comprobante de pago ──────────────────────────────────
     if (["imageMessage", "image"].includes(msgType)) {
         await botResponder(cliente.telefono, "⏳ Procesando tu comprobante...");
-        await procesarPago(message, cliente);
+        await procesarPago(message, cliente, imageBuffer, imagePublicUrl);
         return;
     }
 
@@ -617,31 +640,31 @@ async function manejarUsuarioDesconocido(phone, name, message, configData) {
     );
 }
 
-async function procesarPago(message, cliente) {
+async function procesarPago(message, cliente, buffer = null, publicUrl = null) {
     try {
         const pendientes = await db.collection("pagos_preaprobados")
             .where("senderPhone", "==", cliente.telefono)
             .where("status", "==", "pending").get();
         if (pendientes.size >= 2) {
-            await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre);
             await botResponder(cliente.telefono, "✋ Ya tienes 2 pagos en revisión. Por favor espera.");
             return;
         }
 
-        const buffer = await downloadMediaMessage(message, "buffer", {}, {
-            logger: console,
-            reuploadRequest: sock.updateMediaMessage,
-        });
-
-        const bucket   = admin.storage().bucket();
-        const fileName = `pagos/${cliente.telefono}_${Date.now()}.jpg`;
-        const file     = bucket.file(fileName);
-        await file.save(buffer, { metadata: { contentType: "image/jpeg" } });
-        await file.makePublic();
-        const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-
-        // Guardar el mensaje en el chat CON la URL de la imagen
-        await guardarMensajeChat(cliente.telefono, message, "in", cliente.nombre, { imageUrl: publicUrl, type: "image" });
+        // El buffer y URL ya vienen del handler principal (no descargar/subir de nuevo)
+        if (!buffer) {
+            buffer = await downloadMediaMessage(message, "buffer", {}, {
+                logger: console,
+                reuploadRequest: sock.updateMediaMessage,
+            });
+        }
+        if (!publicUrl) {
+            const bucket   = admin.storage().bucket();
+            const fileName = `pagos/${cliente.telefono}_${Date.now()}.jpg`;
+            const file     = bucket.file(fileName);
+            await file.save(buffer, { metadata: { contentType: "image/jpeg" } });
+            await file.makePublic();
+            publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        }
 
         const nequiConfig  = process.env.CUENTA_NEQUI || "";
         const analisis     = await analizarConIA(buffer, nequiConfig);
