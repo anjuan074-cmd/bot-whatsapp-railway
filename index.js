@@ -957,7 +957,7 @@ async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
 // La IA entiende lenguaje natural: no se necesitan comandos específicos.
 // ==========================================
 
-// ── Busca cliente por nombre parcial o teléfono ────────────────────────────
+// ── Busca UN cliente por nombre parcial o teléfono (flujo de pago manual) ──
 async function buscarClienteEnDB(parametro) {
     const lower  = parametro.toLowerCase().trim();
     const digits = parametro.replace(/\D/g, "");
@@ -970,6 +970,19 @@ async function buscarClienteEnDB(parametro) {
             (digits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(digits))
         ) || null
     );
+}
+
+// ── Busca TODOS los clientes que coincidan con el término ──────────────────
+async function buscarClientesEnDB(parametro) {
+    const lower  = parametro.toLowerCase().trim();
+    const digits = parametro.replace(/\D/g, "");
+    const snap   = await db.collection("clients").get();
+    return snap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter(c =>
+            (c.nombre && c.nombre.toLowerCase().includes(lower)) ||
+            (digits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(digits))
+        );
 }
 
 // ── Genera respuesta natural con Gemini a partir de datos del sistema ──────
@@ -1252,12 +1265,20 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                     await botResponder(phone, await generarRespuestaNatural(texto, "El empleado no especificó a qué cliente buscar.", nombre, rolLabel, empresa));
                     return;
                 }
-                const c = await buscarClienteEnDB(parametro);
-                if (!c) {
+                const resultados = await buscarClientesEnDB(parametro);
+                if (resultados.length === 0) {
                     datosContexto = `No se encontró ningún cliente con el nombre o teléfono "${parametro}" en la base de datos.`;
-                } else {
+                } else if (resultados.length === 1) {
+                    const c = resultados[0];
                     const { totalDebt, monthsStr } = calcularDeudaCliente(c);
                     datosContexto = `Cliente encontrado: ${c.nombre}. Teléfono: ${c.telefono || "no registrado"}. Dirección: ${c.direccion || "no registrada"}. Estado: ${c.estado || "activo"}${c.plan ? `. Plan: ${c.plan}` : ""}. Deuda: ${totalDebt > 0 ? `${fmt(totalDebt)} (meses: ${monthsStr})` : "al día, sin deuda"}.`;
+                } else {
+                    // Múltiples resultados — listar todos
+                    const resumen = resultados.slice(0, 15).map(c => {
+                        const { totalDebt } = calcularDeudaCliente(c);
+                        return `${c.nombre} (tel: ${c.telefono || "S/N"}, deuda: ${totalDebt > 0 ? fmt(totalDebt) : "al día"})`;
+                    });
+                    datosContexto = `Se encontraron ${resultados.length} clientes con "${parametro}": ${resumen.join("; ")}${resultados.length > 15 ? ` (y ${resultados.length - 15} más)` : ""}.`;
                 }
                 break;
             }
