@@ -1194,14 +1194,19 @@ async function manejarConsultaStaff(phone, texto, staffMember) {
 Empleado (${rolLabel}):${historialStr}
 Mensaje actual: "${texto}"
 
-Usa la conversación previa para entender referencias implícitas (por ej: "y ese?" → se refiere al cliente mencionado antes; "los de esa zona?" → retoma la zona anterior; "y cuánto debe?" → historial_pagos del mismo cliente).
+Usa la conversación previa para resolver referencias implícitas. Reglas de contexto:
+- "y ese?", "cuánto debe?", "su teléfono?" → mismo cliente mencionado antes → buscar_cliente con ese nombre
+- "los de esa zona?" → retoma la zona anterior → listar_zona con ese barrio
+- "cuántas en mora?", "cuáles deben?", "y las que deben?" DESPUÉS de buscar un grupo (ej: "las marias") → NO uses clientes_mora general; usa buscar_cliente con el mismo término del grupo (ej: "maria") para filtrar dentro de ese grupo
+- "y las al día?" DESPUÉS de buscar un grupo → buscar_cliente con el mismo término
+- Solo usa clientes_mora o clientes_al_dia cuando la pregunta sea sobre TODOS los clientes en general, sin referencia a un grupo previo
 
 Clasifica en UNO de estos intents:
-- clientes_mora: cuántos/quiénes deben o están en mora (sin mencionar un cliente específico)
-- clientes_al_dia: quiénes están al día, han pagado bien, no tienen deuda
+- clientes_mora: mora general de TODOS los clientes (sin búsqueda previa de grupo)
+- clientes_al_dia: al día general de TODOS los clientes (sin búsqueda previa de grupo)
 - tickets_abiertos: ver tickets/casos de soporte, órdenes de trabajo
 - pagos_pendientes: comprobantes por revisar/aprobar, pagos en espera
-- buscar_cliente: buscar info de uno o varios clientes por nombre/teléfono
+- buscar_cliente: buscar info de uno o varios clientes por nombre/teléfono; también para filtrar dentro de un grupo ya buscado
 - historial_pagos: ver historial de pagos o abonos de UN cliente específico
 - registrar_pago_manual: registrar/anotar/abonar un cobro en efectivo sin comprobante
 - listar_zona: listar clientes en mora de un barrio, zona o sector específico
@@ -1210,7 +1215,7 @@ Clasifica en UNO de estos intents:
 - resumen: resumen general del día, estadísticas globales de la empresa
 
 REGLAS para "parametro":
-- buscar_cliente, historial_pagos, registrar_pago_manual → SOLO el nombre o teléfono del cliente. Si el mensaje actual no lo dice explícitamente, infiere del historial.
+- buscar_cliente, historial_pagos, registrar_pago_manual → SOLO el nombre o teléfono. Si el mensaje actual no lo dice, infiere del historial (ej: si antes se buscó "maria" y ahora pregunta "cuántas en mora?", parametro="maria").
 - listar_zona → nombre del barrio/zona/sector. Infiere del historial si aplica.
 - enviar_mensaje_cliente → "NOMBRE_CLIENTE|MENSAJE" (pipe |). Ej: "envíale a Juan que pague" → "Juan|que pague"
 - registrar_pago_manual → si da nombre Y monto: "NOMBRE|MONTO". Si solo nombre: solo el nombre.
@@ -1301,12 +1306,14 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                     const { totalDebt, monthsStr } = calcularDeudaCliente(c);
                     datosContexto = `Cliente encontrado: ${c.nombre}. Teléfono: ${c.telefono || "no registrado"}. Dirección: ${c.direccion || "no registrada"}. Estado: ${c.estado || "activo"}${c.plan ? `. Plan: ${c.plan}` : ""}. Deuda: ${totalDebt > 0 ? `${fmt(totalDebt)} (meses: ${monthsStr})` : "al día, sin deuda"}.`;
                 } else {
-                    // Múltiples resultados — listar todos
+                    // Múltiples resultados — listar todos con resumen de mora explícito
                     const resumen = resultados.slice(0, 15).map(c => {
                         const { totalDebt } = calcularDeudaCliente(c);
                         return `${c.nombre} (tel: ${c.telefono || "S/N"}, deuda: ${totalDebt > 0 ? fmt(totalDebt) : "al día"})`;
                     });
-                    datosContexto = `Se encontraron ${resultados.length} clientes con "${parametro}": ${resumen.join("; ")}${resultados.length > 15 ? ` (y ${resultados.length - 15} más)` : ""}.`;
+                    const enMora   = resultados.filter(c => calcularDeudaCliente(c).totalDebt > 0);
+                    const alDia    = resultados.length - enMora.length;
+                    datosContexto = `Se encontraron ${resultados.length} clientes con "${parametro}": ${resumen.join("; ")}${resultados.length > 15 ? ` (y ${resultados.length - 15} más)` : ""}. Resumen: ${enMora.length} en mora, ${alDia} al día.`;
                 }
                 break;
             }
