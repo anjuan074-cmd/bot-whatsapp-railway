@@ -985,14 +985,33 @@ async function buscarClientesEnDB(parametro) {
         );
 }
 
-// ── Genera respuesta natural con Gemini a partir de datos del sistema ──────
-async function generarRespuestaNatural(preguntaOriginal, datosContexto, nombre, rolLabel, empresa) {
-    try {
-        const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
-        const result = await model.generateContent(
-`Eres el asistente interno de ${empresa}. Respóndele a *${nombre}* (${rolLabel}).
+// ── Guarda el intercambio en el historial de conversación del staff ────────
+async function appendConversationHistory(phone, userText, botText) {
+    const ref  = db.collection("staff_states").doc(phone);
+    const snap = await ref.get();
+    const prev = snap.exists ? (snap.data().conversationHistory || []) : [];
+    const updated = [
+        ...prev,
+        { role: "user", text: userText.slice(0, 400) },
+        { role: "bot",  text: botText.slice(0, 400) },
+    ].slice(-20); // máximo 10 turnos (20 entradas)
+    await ref.set({
+        conversationHistory: updated,
+        expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 24 * 60 * 60 * 1000),
+    }, { merge: true });
+}
 
-Lo que escribió: "${preguntaOriginal}"
+// ── Genera respuesta natural con Gemini a partir de datos del sistema ──────
+async function generarRespuestaNatural(preguntaOriginal, datosContexto, nombre, rolLabel, empresa, history = []) {
+    try {
+        const model = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
+        const historialStr = history.length > 0
+            ? `\nConversación previa:\n${history.map(h => `${h.role === "user" ? nombre : "Bot"}: ${h.text}`).join("\n")}\n`
+            : "";
+        const result = await model.generateContent(
+`Eres el asistente interno de ${empresa}. Respóndele a ${nombre} (${rolLabel}).
+${historialStr}
+Lo que escribió ahora: "${preguntaOriginal}"
 
 Información del sistema para responder:
 ${datosContexto}
@@ -1004,7 +1023,8 @@ Reglas:
 - Si hay varios ítems, usa viñetas con "•"
 - No digas "Hola" ni repitas el nombre si es una respuesta a datos
 - Si no hay datos suficientes, pregunta naturalmente qué necesita
-- Tono de colega que sabe del sistema, no de robot`
+- Tono de colega que sabe del sistema, no de robot
+- Ten en cuenta la conversación previa para dar continuidad`
         );
         return result.response.text().trim();
     } catch {
@@ -1155,7 +1175,13 @@ async function manejarConsultaStaff(phone, texto, staffMember) {
         if (handled) return;
     }
 
-    // ── Clasificar intención con Gemini ──────────────────────────────────────
+    // ── Cargar historial de conversación ─────────────────────────────────────
+    const history = staffState?.conversationHistory || [];
+    const historialStr = history.length > 0
+        ? `\nConversación previa (para contexto):\n${history.map(h => `${h.role === "user" ? nombre : "Bot"}: ${h.text}`).join("\n")}\n`
+        : "";
+
+    // ── Clasificar intención con Gemini (con historial para desambiguar) ──────
     const rolLabel = rol === "cobrador" ? "cobrador (gestiona cobros y mora)"
                    : rol === "admin"    ? "administrador del sistema"
                    :                     "técnico de campo";
@@ -1165,27 +1191,29 @@ async function manejarConsultaStaff(phone, texto, staffMember) {
         const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
         const result = await model.generateContent(
 `Eres el clasificador de consultas internas de ${empresa}.
-Empleado (${rolLabel}) escribió: "${texto}"
+Empleado (${rolLabel}):${historialStr}
+Mensaje actual: "${texto}"
+
+Usa la conversación previa para entender referencias implícitas (por ej: "y ese?" → se refiere al cliente mencionado antes; "los de esa zona?" → retoma la zona anterior; "y cuánto debe?" → historial_pagos del mismo cliente).
 
 Clasifica en UNO de estos intents:
 - clientes_mora: cuántos/quiénes deben o están en mora (sin mencionar un cliente específico)
 - clientes_al_dia: quiénes están al día, han pagado bien, no tienen deuda
 - tickets_abiertos: ver tickets/casos de soporte, órdenes de trabajo
 - pagos_pendientes: comprobantes por revisar/aprobar, pagos en espera
-- buscar_cliente: buscar info completa de UN cliente específico (dirección, deuda, estado, teléfono)
+- buscar_cliente: buscar info de uno o varios clientes por nombre/teléfono
 - historial_pagos: ver historial de pagos o abonos de UN cliente específico
-- registrar_pago_manual: registrar/anotar/abonar un cobro en efectivo sin comprobante para un cliente
+- registrar_pago_manual: registrar/anotar/abonar un cobro en efectivo sin comprobante
 - listar_zona: listar clientes en mora de un barrio, zona o sector específico
 - enviar_mensaje_cliente: enviar un mensaje de WhatsApp a un cliente específico
 - tecnico_carga: ver carga de trabajo o tickets asignados por técnico
 - resumen: resumen general del día, estadísticas globales de la empresa
-- ayuda: qué puedes hacer, menú de comandos, lista de opciones
 
 REGLAS para "parametro":
-- buscar_cliente, historial_pagos, registrar_pago_manual → SOLO el nombre o teléfono del cliente (sin "de"/"para"/"a")
-- listar_zona → nombre del barrio/zona/sector
-- enviar_mensaje_cliente → "NOMBRE_CLIENTE|MENSAJE" (separados por pipe |). Ej: si dice "envíale a Juan que pague", parametro="Juan|que pague"
-- registrar_pago_manual → si da nombre Y monto: "NOMBRE|MONTO" (ej: "Juan Lopez|50000"). Si solo nombre: solo el nombre.
+- buscar_cliente, historial_pagos, registrar_pago_manual → SOLO el nombre o teléfono del cliente. Si el mensaje actual no lo dice explícitamente, infiere del historial.
+- listar_zona → nombre del barrio/zona/sector. Infiere del historial si aplica.
+- enviar_mensaje_cliente → "NOMBRE_CLIENTE|MENSAJE" (pipe |). Ej: "envíale a Juan que pague" → "Juan|que pague"
+- registrar_pago_manual → si da nombre Y monto: "NOMBRE|MONTO". Si solo nombre: solo el nombre.
 
 Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena o vacío>"}`
         );
@@ -1449,8 +1477,10 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
             }
         }
 
-        const respuesta = await generarRespuestaNatural(texto, datosContexto, nombre, rolLabel, empresa);
+        const respuesta = await generarRespuestaNatural(texto, datosContexto, nombre, rolLabel, empresa, history);
         await botResponder(phone, respuesta);
+        // Guardar el intercambio para mantener el hilo en el próximo mensaje
+        await appendConversationHistory(phone, texto, respuesta).catch(() => {});
 
     } catch (e) {
         console.error("[STAFF] Error en consulta:", e.message);
