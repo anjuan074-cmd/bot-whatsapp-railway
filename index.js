@@ -1422,6 +1422,149 @@ async function manejarFlujoAgregar(phone, texto, nombre, state) {
         await botResponder(phone, `✅ Empresa "*${state.valor}*" creada.\nID: ${ref.id.slice(0,6).toUpperCase()}\n_Por ${nombre}_`);
         return true;
     }
+    // ── Eliminar barrio / empresa ─────────────────────────────────────────────
+    if (state.stage === "eliminar_barrio_confirmar") {
+        if (!/^(s[ií]|yes|ok|listo)$/i.test(tn)) {
+            await botResponder(phone, `Responde *sí* para eliminar "${state.barrio}" o *cancelar*.`); return true;
+        }
+        const nuevaLista = (state.lista||[]).filter((_,i)=>i!==state.idx);
+        await db.collection("settings").doc("barrios").set({ lista:nuevaLista }, { merge:true });
+        await clearStaffState(phone);
+        await botResponder(phone, `✅ Barrio "*${state.barrio}*" eliminado.\nTotal: ${nuevaLista.length}\n_Por ${nombre}_`);
+        return true;
+    }
+    if (state.stage === "eliminar_empresa_confirmar") {
+        if (!/^(s[ií]|yes|ok|listo)$/i.test(tn)) {
+            await botResponder(phone, `Responde *sí* para eliminar "${state.empresaNombre}" o *cancelar*.`); return true;
+        }
+        await db.collection("empresas").doc(state.empresaId).delete();
+        await clearStaffState(phone);
+        await botResponder(phone, `✅ Empresa "*${state.empresaNombre}*" eliminada.\n_Por ${nombre}_`);
+        return true;
+    }
+    return false;
+}
+
+// ── Flujo: cambiar estado de cliente ──────────────────────────────────────
+async function manejarFlujoCambiarEstado(phone, texto, nombre, state) {
+    const tn = texto.toLowerCase().trim();
+    if (/^(cancelar|salir|cancel)$/i.test(tn)) {
+        await clearStaffState(phone); await botResponder(phone, "❌ Cancelado."); return true;
+    }
+    if (state.stage === "estado_confirmar") {
+        if (!/^(s[ií]|yes|ok|listo|confirmo)$/i.test(tn)) {
+            await botResponder(phone, "Responde *sí* para confirmar o *cancelar*."); return true;
+        }
+        await db.collection("clients").doc(state.clienteId).set({ estado:state.nuevoEstado }, { merge:true });
+        await clearStaffState(phone);
+        await botResponder(phone, `✅ *${state.clienteNombre}* → estado *${state.nuevoEstado}*\n_Por ${nombre}_`);
+        return true;
+    }
+    return false;
+}
+
+// ── Flujo: registrar gasto ────────────────────────────────────────────────
+async function manejarFlujoRegistrarGasto(phone, texto, nombre, state) {
+    const tn   = texto.toLowerCase().trim();
+    const fmt2 = (n) => new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(n);
+    if (/^(cancelar|salir|cancel)$/i.test(tn)) {
+        await clearStaffState(phone); await botResponder(phone, "❌ Gasto cancelado."); return true;
+    }
+
+    if (state.stage === "gasto_monto") {
+        const monto = parseInt(texto.replace(/\D/g,""),10);
+        if (!monto||monto<100) { await botResponder(phone,"Escribe un monto válido (ej: *50000*). O *cancelar*."); return true; }
+        await setStaffState(phone, {...state, stage:"gasto_categoria", monto});
+        const cats = state.tipo==="in"
+            ? ["Instalación","Reconexión","Venta Extra","Otro"]
+            : ["Operativo","Técnico","Servicios","Nómina","Arriendo","Transporte","Comunicaciones","Otro"];
+        await botResponder(phone, `💵 Monto: *${fmt2(monto)}*\n\n¿Categoría?\n${cats.map(c=>`• ${c}`).join("\n")}\n\nO *cancelar*.`);
+        return true;
+    }
+
+    if (state.stage === "gasto_categoria") {
+        const cats = state.tipo==="in"
+            ? ["Instalación","Reconexión","Venta Extra","Otro"]
+            : ["Operativo","Técnico","Servicios","Nómina","Arriendo","Transporte","Comunicaciones","Otro"];
+        const sin  = tn.normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+        const cat  = cats.find(c => sin.includes(c.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"")));
+        if (!cat) { await botResponder(phone,`Elige una:\n${cats.map(c=>`• ${c}`).join("\n")}\n\nO *cancelar*.`); return true; }
+        await setStaffState(phone, {...state, stage:"gasto_confirmar", categoria:cat});
+        await botResponder(phone, `📋 *Confirma el ${state.tipo==="in"?"ingreso":"gasto"}:*\n\n💵 ${fmt2(state.monto)}\n🏷️ ${cat}\n📝 ${state.descripcion||cat}\n💳 ${state.metodo||"Efectivo"}\n\nEscribe *sí* o *cancelar*.`);
+        return true;
+    }
+
+    if (state.stage === "gasto_confirmar") {
+        if (!/^(s[ií]|yes|ok|listo|confirmo)$/i.test(tn)) {
+            await botResponder(phone,"Responde *sí* para registrar o *cancelar*."); return true;
+        }
+        await db.collection("expenses").add({
+            type:        state.tipo||"out",
+            amount:      state.monto,
+            description: state.descripcion||state.categoria,
+            category:    state.categoria,
+            method:      state.metodo||"Efectivo",
+            date:        new Date().toISOString(),
+            user:        nombre,
+            source:      "bot",
+        });
+        await clearStaffState(phone);
+        await botResponder(phone, `✅ *${state.tipo==="in"?"Ingreso":"Gasto"} registrado*\n💵 ${fmt2(state.monto)} | ${state.categoria}\n_Por ${nombre}_`);
+        return true;
+    }
+    return false;
+}
+
+// ── Flujo: crear cliente nuevo ────────────────────────────────────────────
+async function manejarFlujoCrearCliente(phone, texto, nombre, state) {
+    const tn   = texto.toLowerCase().trim();
+    const fmt2 = (n) => new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(n);
+    if (/^(cancelar|salir|cancel)$/i.test(tn)) {
+        await clearStaffState(phone); await botResponder(phone,"❌ Creación de cliente cancelada."); return true;
+    }
+
+    if (state.stage === "cliente_nombre") {
+        if (texto.trim().length < 3) { await botResponder(phone,"Escribe el nombre completo del cliente. O *cancelar*."); return true; }
+        await setStaffState(phone,{...state, stage:"cliente_telefono", clienteNombre:texto.trim()});
+        await botResponder(phone,`📱 ¿Cuál es el teléfono de *${texto.trim()}*? (10 dígitos)\n\nO escribe *omitir* si no tiene. O *cancelar*.`);
+        return true;
+    }
+
+    if (state.stage === "cliente_telefono") {
+        const tel = texto.replace(/\D/g,"");
+        if (tn!=="omitir" && tel.length < 10) { await botResponder(phone,"Teléfono inválido (10 dígitos). O escribe *omitir* si no tiene."); return true; }
+        await setStaffState(phone,{...state, stage:"cliente_direccion", telefono: tn==="omitir"?"":tel});
+        await botResponder(phone,"🏠 ¿Cuál es la dirección? O *omitir*. O *cancelar*.");
+        return true;
+    }
+
+    if (state.stage === "cliente_direccion") {
+        const dir = tn==="omitir" ? "" : texto.trim();
+        await setStaffState(phone,{...state, stage:"cliente_confirmar", direccion:dir});
+        await botResponder(phone,
+            `📋 *Confirma el nuevo cliente:*\n\n👤 ${state.clienteNombre}\n📱 ${state.telefono||"Sin teléfono"}\n🏠 ${dir||"Sin dirección"}\n\nEscribe *sí* para crear o *cancelar*.`
+        );
+        return true;
+    }
+
+    if (state.stage === "cliente_confirmar") {
+        if (!/^(s[ií]|yes|ok|listo|confirmo)$/i.test(tn)) {
+            await botResponder(phone,"Responde *sí* para crear el cliente o *cancelar*."); return true;
+        }
+        const ref = await db.collection("clients").add({
+            nombre:    state.clienteNombre,
+            telefono:  state.telefono||"",
+            direccion: state.direccion||"",
+            estado:    "instalacion",
+            pago:      0,
+            pagos:     {},
+            creadoPor: nombre,
+            creadoEn:  admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await clearStaffState(phone);
+        await botResponder(phone,`✅ *Cliente creado*\n👤 ${state.clienteNombre}\n📱 ${state.telefono||"S/N"}\n🏠 ${state.direccion||"S/D"}\nID: ${ref.id.slice(0,6).toUpperCase()}\n_Por ${nombre}_`);
+        return true;
+    }
     return false;
 }
 
@@ -1439,11 +1582,15 @@ async function manejarConsultaStaff(phone, texto, staffMember) {
     }
     const staffState = await getStaffState(phone);
     const stage = staffState?.stage || "";
-    if (stage.startsWith("pago_manual_"))      { if (await manejarFlujoPagoManual(phone, texto, nombre, staffState))   return; }
-    if (stage.startsWith("editar_usuario_"))   { if (await manejarFlujoEditarUsuario(phone, texto, nombre, staffState)) return; }
-    if (stage.startsWith("anular_pago_"))      { if (await manejarFlujoAnularPago(phone, texto, nombre, staffState))    return; }
-    if (stage.startsWith("aprobar_pago_"))     { if (await manejarFlujoAprobarPago(phone, texto, nombre, staffState))   return; }
-    if (stage.startsWith("agregar_"))          { if (await manejarFlujoAgregar(phone, texto, nombre, staffState))       return; }
+    if (stage.startsWith("pago_manual_"))      { if (await manejarFlujoPagoManual(phone, texto, nombre, staffState))     return; }
+    if (stage.startsWith("editar_usuario_"))   { if (await manejarFlujoEditarUsuario(phone, texto, nombre, staffState))   return; }
+    if (stage.startsWith("anular_pago_"))      { if (await manejarFlujoAnularPago(phone, texto, nombre, staffState))      return; }
+    if (stage.startsWith("aprobar_pago_"))     { if (await manejarFlujoAprobarPago(phone, texto, nombre, staffState))     return; }
+    if (stage.startsWith("agregar_") ||
+        stage.startsWith("eliminar_"))         { if (await manejarFlujoAgregar(phone, texto, nombre, staffState))         return; }
+    if (stage.startsWith("estado_"))           { if (await manejarFlujoCambiarEstado(phone, texto, nombre, staffState))   return; }
+    if (stage.startsWith("gasto_"))            { if (await manejarFlujoRegistrarGasto(phone, texto, nombre, staffState))  return; }
+    if (stage.startsWith("cliente_"))          { if (await manejarFlujoCrearCliente(phone, texto, nombre, staffState))    return; }
 
     // ── Historial de conversación ─────────────────────────────────────────────
     const history = staffState?.conversationHistory || [];
@@ -1485,20 +1632,28 @@ ACCIONES:
 - agregar_barrio: agregar un nuevo barrio/zona al sistema
 - listar_empresas: ver las empresas registradas
 - agregar_empresa: agregar una nueva empresa al sistema
+- cambiar_estado_cliente: cambiar estado de un cliente a activo/cortado/inactivo/retirado
+- registrar_gasto: registrar un gasto o ingreso en el sistema
+- ver_gastos: ver resumen de gastos del día/semana/mes
+- listar_planes: ver planes de internet disponibles
+- ver_instalaciones: ver órdenes de instalación pendientes o por técnico
+- crear_cliente: crear/registrar un nuevo cliente en el sistema
+- toggle_humanmode: pausar o reactivar el bot para UN cliente específico
+- ver_caja: ver resumen de caja del día
 - carga_tecnico: carga de trabajo de técnicos
 - resumen: resumen general del día
 - conversacion: saludo, pregunta general, o respuesta deducible del historial
 
 PARÁMETROS (solo los que apliquen):
-- "buscar": nombre parcial o teléfono. Si es follow-up de un grupo previo, reutiliza el término del historial.
+- "buscar": nombre parcial o teléfono. Si es follow-up de grupo previo, reutiliza el término del historial.
 - "ordenar": "ultimo_pago" si pregunta quién pagó recientemente; "mora" si pregunta quién más debe; "" si no.
 - "zona": barrio o sector.
-- "pago_info": "NOMBRE|MONTO" o solo "NOMBRE" para pago manual.
+- "pago_info": "NOMBRE|MONTO" para pago manual; "MONTO|CATEGORIA|DESCRIPCION|METODO|TIPO" para gasto (TIPO: out=egreso, in=ingreso; METODO: Efectivo/Nequi/Banco/Daviplata).
 - "mensaje_cliente": "NOMBRE|TEXTO" para enviar mensaje.
-- "accion_pago": "aprobar" o "rechazar" (para aprobar_pago/rechazar_pago).
-- "nuevo_valor": barrio o empresa a agregar.
+- "accion_pago": "aprobar" o "rechazar".
+- "nuevo_valor": estado nuevo para cambiar_estado_cliente (activo/cortado/inactivo/retirado); barrio/empresa a agregar o eliminar; "pausar"/"activar" para toggle_humanmode; "hoy"/"semana"/"mes" para ver_gastos; "pending"/"all" para ver_instalaciones.
 
-REGLA CLAVE: follow-ups de grupo → buscar_clientes con mismo "buscar" del historial. NUNCA mora_global para seguimientos.
+REGLA CLAVE: follow-ups de grupo → buscar_clientes con mismo "buscar" del historial. NUNCA mora_global/al_dia_global para seguimientos de grupo.
 
 Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona":"...","pago_info":"...","mensaje_cliente":"...","accion_pago":"...","nuevo_valor":"..."}`
         );
@@ -1885,10 +2040,167 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                 return;
             }
 
+            // ── Cambiar estado cliente ────────────────────────────────────────
+            case "cambiar_estado_cliente": {
+                const estadosOk = ["activo","cortado","inactivo","retirado","instalacion"];
+                if (!buscar) { datosContexto = "No se especificó el cliente a modificar."; break; }
+                const estNuevo = (nuevoValor||"").toLowerCase();
+                if (!estadosOk.includes(estNuevo)) { datosContexto = `Estado inválido. Válidos: activo, cortado, inactivo, retirado.`; break; }
+                const cEst = await buscarClienteEnDB(buscar);
+                if (!cEst) { datosContexto = `No se encontró el cliente "${buscar}".`; break; }
+                await setStaffState(phone, { stage:"estado_confirmar", clienteId:cEst.id, clienteNombre:cEst.nombre, estadoActual:cEst.estado||"activo", nuevoEstado:estNuevo, conversationHistory:staffState?.conversationHistory||[] });
+                await botResponder(phone, `📋 *Confirma cambio de estado:*\n\n👤 ${cEst.nombre}\n🏷️ Actual: *${cEst.estado||"activo"}*\n🔄 Nuevo: *${estNuevo}*\n\nEscribe *sí* o *cancelar*.`);
+                return;
+            }
+
+            // ── Registrar gasto / ingreso ─────────────────────────────────────
+            case "registrar_gasto": {
+                const fmt3 = (n)=>new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(n);
+                let gMonto=0, gCat="", gDesc="", gMet="Efectivo", gTipo="out";
+                if (pagoInfo) {
+                    const pp = pagoInfo.split("|");
+                    gMonto = parseInt((pp[0]||"").replace(/\D/g,""),10)||0;
+                    gCat   = pp[1]||""; gDesc = pp[2]||gCat; gMet = pp[3]||"Efectivo"; gTipo = pp[4]||"out";
+                }
+                if (!gMonto||gMonto<100) {
+                    await setStaffState(phone,{stage:"gasto_monto", tipo:gTipo, descripcion:gDesc, metodo:gMet, conversationHistory:staffState?.conversationHistory||[]});
+                    await botResponder(phone,"💵 ¿Cuánto es el gasto? Escribe el monto (ej: *50000*).\nO *cancelar*."); return;
+                }
+                if (!gCat) {
+                    await setStaffState(phone,{stage:"gasto_categoria", monto:gMonto, tipo:gTipo, descripcion:gDesc, metodo:gMet, conversationHistory:staffState?.conversationHistory||[]});
+                    const cats = gTipo==="in" ? ["Instalación","Reconexión","Venta Extra","Otro"] : ["Operativo","Técnico","Servicios","Nómina","Arriendo","Transporte","Comunicaciones","Otro"];
+                    await botResponder(phone, `💵 ${fmt3(gMonto)}\n\n¿Categoría?\n${cats.map(c=>`• ${c}`).join("\n")}\n\nO *cancelar*.`); return;
+                }
+                // Directo a confirmar
+                await setStaffState(phone,{stage:"gasto_confirmar", monto:gMonto, categoria:gCat, descripcion:gDesc, metodo:gMet, tipo:gTipo, conversationHistory:staffState?.conversationHistory||[]});
+                await botResponder(phone, `📋 *Confirma el ${gTipo==="in"?"ingreso":"gasto"}:*\n\n💵 ${fmt3(gMonto)}\n🏷️ ${gCat}\n📝 ${gDesc||gCat}\n💳 ${gMet}\n\nEscribe *sí* o *cancelar*.`);
+                return;
+            }
+
+            // ── Ver gastos ────────────────────────────────────────────────────
+            case "ver_gastos": {
+                const periodo = (nuevoValor||"hoy").toLowerCase();
+                const desde   = new Date();
+                if (periodo.includes("semana")) desde.setDate(desde.getDate()-7);
+                else if (periodo.includes("mes")) desde.setMonth(desde.getMonth()-1);
+                else desde.setHours(0,0,0,0);
+                const snapG = await db.collection("expenses").where("date",">=",desde.toISOString()).get();
+                const gastos = snapG.docs.map(d=>d.data());
+                const egreso  = gastos.filter(g=>g.type!=="in").reduce((s,g)=>s+(g.amount||0),0);
+                const ingreso = gastos.filter(g=>g.type==="in").reduce((s,g)=>s+(g.amount||0),0);
+                const porCat  = {};
+                gastos.filter(g=>g.type!=="in").forEach(g=>{ const c=g.category||"Otro"; porCat[c]=(porCat[c]||0)+(g.amount||0); });
+                const desglose = Object.entries(porCat).sort((a,b)=>b[1]-a[1]).map(([c,v])=>`${c}: ${fmt(v)}`).join(", ");
+                datosContexto = `Gastos ${periodo} (${gastos.length} registros): Egresos ${fmt(egreso)}, Ingresos adicionales ${fmt(ingreso)}, Balance ${fmt(ingreso-egreso)}. Desglose egresos: ${desglose||"sin datos"}.`;
+                break;
+            }
+
+            // ── Ver caja ──────────────────────────────────────────────────────
+            case "ver_caja": {
+                const inicio = new Date(); inicio.setHours(0,0,0,0);
+                const [expSnap, pagSnap] = await Promise.all([
+                    db.collection("expenses").where("date",">=",inicio.toISOString()).get(),
+                    db.collection("pagos_preaprobados").where("status","==","approved").orderBy("approvedAt","desc").limit(30).get(),
+                ]);
+                const gastos  = expSnap.docs.map(d=>d.data());
+                const egreso  = gastos.filter(g=>g.type!=="in").reduce((s,g)=>s+(g.amount||0),0);
+                const ingreso = gastos.filter(g=>g.type==="in").reduce((s,g)=>s+(g.amount||0),0);
+                // Pagos aprobados hoy
+                const hoy = new Date().toLocaleDateString("es-CO");
+                const pagosHoy = pagSnap.docs.filter(d => {
+                    const at = d.data().approvedAt?.toDate?.();
+                    return at && at.toLocaleDateString("es-CO") === hoy;
+                });
+                const totalPagos = pagosHoy.reduce((s,d)=>s+(d.data().extractedAmount||0),0);
+                datosContexto = `Caja hoy: Pagos aprobados ${fmt(totalPagos)} (${pagosHoy.length} transacciones). Ingresos extra ${fmt(ingreso)}, Egresos ${fmt(egreso)}, Efectivo neto aprox. ${fmt(totalPagos+ingreso-egreso)}.`;
+                break;
+            }
+
+            // ── Listar planes ─────────────────────────────────────────────────
+            case "listar_planes": {
+                const snapPl = await db.collection("planes").get();
+                if (snapPl.empty) { datosContexto = "No hay planes registrados. Se crean desde Configuración → Catálogos."; break; }
+                const planes = snapPl.docs.map(d=>{ const p=d.data(); return `• ${p.nombre||d.id}: ${p.valor?fmt(p.valor):"precio no definido"}`; });
+                datosContexto = `Planes disponibles (${snapPl.size}):\n${planes.join("\n")}`;
+                break;
+            }
+
+            // ── Ver instalaciones ─────────────────────────────────────────────
+            case "ver_instalaciones": {
+                let q = db.collection("installations");
+                const filtroStatus = nuevoValor==="all" ? null : "pending";
+                if (filtroStatus) q = q.where("status","==",filtroStatus);
+                const snapI = await q.orderBy("createdAt","desc").limit(30).get();
+                let insts = snapI.docs.map(d=>({id:d.id,...d.data()}));
+                if (buscar) {
+                    const bl = buscar.toLowerCase();
+                    insts = insts.filter(i=>(i.technician||i.clientName||"").toLowerCase().includes(bl));
+                }
+                if (!insts.length) { datosContexto = `No hay instalaciones ${filtroStatus||""}${buscar?` de "${buscar}"`:""}. `; break; }
+                const filas = insts.slice(0,10).map(i=>`• ${i.clientName||"?"} | ${i.clientAddress||"S/D"} | Tec: ${i.technician||"Sin asignar"} | ${i.type||"instalacion"} | ${i.status||"?"}`);
+                datosContexto = `Instalaciones${buscar?` de "${buscar}"`:""}${filtroStatus?" pendientes":""} (${insts.length}):\n${filas.join("\n")}${insts.length>10?`\n(y ${insts.length-10} más)`:""}`;
+                break;
+            }
+
+            // ── Crear cliente ─────────────────────────────────────────────────
+            case "crear_cliente": {
+                await setStaffState(phone,{stage:"cliente_nombre", conversationHistory:staffState?.conversationHistory||[]});
+                const inicialNombre = buscar || nuevoValor;
+                if (inicialNombre) {
+                    if (await manejarFlujoCrearCliente(phone, inicialNombre, nombre, {stage:"cliente_nombre"})) return;
+                }
+                await botResponder(phone,"👤 ¿Cómo se llama el nuevo cliente?\nEscribe el nombre completo. O *cancelar*.");
+                return;
+            }
+
+            // ── Pausar / reactivar bot para un cliente ────────────────────────
+            case "toggle_humanmode": {
+                if (!buscar) { datosContexto = "No se especificó el cliente."; break; }
+                const cHM = await buscarClienteEnDB(buscar);
+                if (!cHM) { datosContexto = `No se encontró el cliente "${buscar}".`; break; }
+                const telHM = normalizePhone(cHM.telefono||"");
+                if (!telHM) { datosContexto = `${cHM.nombre} no tiene teléfono registrado.`; break; }
+                const esActivar = (nuevoValor||"").toLowerCase().includes("activ")||
+                                  (nuevoValor||"").toLowerCase().includes("bot")||
+                                  (nuevoValor||"").toLowerCase().includes("resum");
+                const nuevoModo = !esActivar; // humanMode=true → bot pausado
+                await db.collection("chats").doc(telHM).set({ humanMode:nuevoModo }, { merge:true });
+                datosContexto = `Bot ${nuevoModo?"pausado (atención humana activada)":"reactivado"} para ${cHM.nombre} (${telHM}).`;
+                break;
+            }
+
+            // ── Eliminar barrio ───────────────────────────────────────────────
+            case "eliminar_barrio": {
+                if (rol!=="admin") { datosContexto="Solo admins pueden eliminar barrios."; break; }
+                const termB = buscar||nuevoValor;
+                if (!termB) { datosContexto="No se indicó qué barrio eliminar."; break; }
+                const refB  = db.collection("settings").doc("barrios");
+                const snapB = await refB.get();
+                const listaB = snapB.exists?(snapB.data().lista||[]):[];
+                const idxB   = listaB.findIndex(b=>b.toLowerCase().includes(termB.toLowerCase()));
+                if (idxB===-1) { datosContexto=`No se encontró el barrio "${termB}".`; break; }
+                await setStaffState(phone,{stage:"eliminar_barrio_confirmar", barrio:listaB[idxB], lista:listaB, idx:idxB, conversationHistory:staffState?.conversationHistory||[]});
+                await botResponder(phone,`⚠️ ¿Confirmas eliminar el barrio "*${listaB[idxB]}*"?\n\nEscribe *sí* o *cancelar*.`);
+                return;
+            }
+
+            // ── Eliminar empresa ──────────────────────────────────────────────
+            case "eliminar_empresa": {
+                if (rol!=="admin") { datosContexto="Solo admins pueden eliminar empresas."; break; }
+                const termE = buscar||nuevoValor;
+                if (!termE) { datosContexto="No se indicó qué empresa eliminar."; break; }
+                const snapE = await db.collection("empresas").get();
+                const foundE = snapE.docs.find(d=>(d.data().nombre||"").toLowerCase().includes(termE.toLowerCase()));
+                if (!foundE) { datosContexto=`No se encontró la empresa "${termE}".`; break; }
+                await setStaffState(phone,{stage:"eliminar_empresa_confirmar", empresaId:foundE.id, empresaNombre:foundE.data().nombre||foundE.id, conversationHistory:staffState?.conversationHistory||[]});
+                await botResponder(phone,`⚠️ ¿Confirmas eliminar la empresa "*${foundE.data().nombre||foundE.id}*"?\n\nEscribe *sí* o *cancelar*.`);
+                return;
+            }
+
             default: {
                 datosContexto = history.length > 0
                     ? "Responde basándote en el historial de conversación. Si no hay datos suficientes, pregunta qué necesita."
-                    : `Saluda a ${nombre} y dile que puede consultarte sobre clientes, cobros, pagos, comprobantes, usuarios, barrios, empresas, tickets y más.`;
+                    : `Saluda a ${nombre} y dile que puede consultarte sobre clientes, cobros, pagos, comprobantes, usuarios, barrios, empresas, tickets, gastos, instalaciones y más.`;
                 break;
             }
         }
