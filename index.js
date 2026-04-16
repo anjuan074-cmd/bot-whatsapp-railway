@@ -979,13 +979,14 @@ Clasifica en UNO de estos intents:
 - clientes_mora: cuántos/quiénes deben, mora, deudas
 - tickets_abiertos: tickets, casos, soporte abierto, técnicos
 - pagos_pendientes: comprobantes por aprobar, pagos en espera
-- buscar_cliente: busca a un cliente específico por nombre o teléfono (info general)
-- historial_pagos: pagos, abonos, comprobantes o historial de un cliente específico
+- buscar_cliente: busca a un cliente específico por nombre o teléfono (info general, estado de cuenta, deuda, saldo)
+- historial_pagos: pagos, abonos, comprobantes o historial de pagos de un cliente específico
 - tecnico_carga: carga de trabajo por técnico, quién tiene más tickets
 - resumen: resumen general, estadísticas, cómo vamos hoy
 - otro: cualquier otra cosa
 
-Si el intent es buscar_cliente o historial_pagos, extrae el nombre o teléfono buscado en "parametro".
+IMPORTANTE: "estado de cuenta de X", "cuánto debe X", "deuda de X", "busca a X" → buscar_cliente con parametro = nombre exacto de X.
+Si el intent es buscar_cliente o historial_pagos, extrae el nombre o teléfono buscado en "parametro". El parametro debe ser SOLO el nombre del cliente, sin frases como "de", "para", etc.
 
 Responde SOLO JSON: {"intent":"<valor>","parametro":"<cadena o vacío>"}`
         );
@@ -1053,10 +1054,11 @@ Responde SOLO JSON: {"intent":"<valor>","parametro":"<cadena o vacío>"}`
             case "buscar_cliente": {
                 if (!parametro) { await botResponder(phone, "¿A quién buscas? Escribe el nombre o teléfono del cliente."); break; }
                 const termLower = parametro.toLowerCase();
+                const termDigits = parametro.replace(/\D/g, "");
                 const snap = await db.collection("clients").get();
                 const matches = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(c =>
                     (c.nombre && c.nombre.toLowerCase().includes(termLower)) ||
-                    (c.telefono && c.telefono.replace(/\D/g,"").includes(parametro.replace(/\D/g,"")))
+                    (termDigits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(termDigits))
                 ).slice(0, 3);
                 if (matches.length === 0) {
                     await botResponder(phone, `🔍 No encontré clientes que coincidan con "*${parametro}*".`);
@@ -1119,12 +1121,15 @@ Responde SOLO JSON: {"intent":"<valor>","parametro":"<cadena o vacío>"}`
                     break;
                 }
                 const termLower2 = parametro.toLowerCase();
+                const termDigits2 = parametro.replace(/\D/g, "");
                 const snapH = await db.collection("clients").get();
-                const clienteH = snapH.docs
-                    .map(d => ({ id: d.id, ...d.data() }))
-                    .find(c =>
+                const allClientsH = snapH.docs.map(d => ({ id: d.id, ...d.data() }));
+                // Buscar coincidencia exacta primero, luego parcial
+                const clienteH =
+                    allClientsH.find(c => c.nombre && c.nombre.toLowerCase() === termLower2) ||
+                    allClientsH.find(c =>
                         (c.nombre && c.nombre.toLowerCase().includes(termLower2)) ||
-                        (c.telefono && c.telefono.replace(/\D/g, "").includes(parametro.replace(/\D/g, "")))
+                        (termDigits2.length >= 6 && c.telefono && c.telefono.replace(/\D/g, "").includes(termDigits2))
                     );
                 if (!clienteH) {
                     await botResponder(phone, `🔍 No encontré un cliente con "*${parametro}*".`);
