@@ -418,6 +418,29 @@ async function procesarMensajeEntrante(message) {
         await db.collection("chats").doc(userPhone).set({ humanMode: true }, { merge: true });
     }
 
+    // ── Detectar si es personal interno (admin / cobrador / tecnico) ──────────
+    // Traemos todos los perfiles de staff y comparamos normalizando los dígitos
+    // para no fallar por diferencias de formato (+57, espacios, 10 vs 12 dígitos).
+    const userPhone10 = userPhone.slice(-10); // últimos 10 dígitos del número entrante
+    const staffSnap = await db.collection("user_profiles")
+        .where("role", "in", ["admin", "cobrador", "tecnico"])
+        .get();
+    const staffDoc = staffSnap.docs.find(d => {
+        const data = d.data();
+        // Puede estar en el campo "phone" o "telefono"
+        const raw = (data.phone || data.telefono || "").replace(/\D/g, "");
+        // Coincide si los últimos 10 dígitos son iguales
+        return raw.slice(-10) === userPhone10;
+    });
+    const staffMember = staffDoc ? { id: staffDoc.id, ...staffDoc.data() } : null;
+    const isStaff = !!staffMember;
+
+    if (isStaff) {
+        const texto = (message.message?.conversation || message.message?.extendedTextMessage?.text || "").trim();
+        if (texto) await manejarConsultaStaff(userPhone, texto, staffMember);
+        return;
+    }
+
     if (!isHumanMode) {
         const configData = configSnap.exists ? configSnap.data() : {};
         if (!cliente) {
@@ -532,51 +555,13 @@ Responde SOLO con JSON válido sin texto adicional:
             break;
         }
 
-        case "soporte": {
-            const existente = await db.collection("support_tickets")
-                .where("clienteId", "==", cliente.id)
-                .where("tipo", "==", "soporte")
-                .where("estado", "==", "abierto").get();
-            if (!existente.empty) {
-                await botResponder(cliente.telefono,
-                    `${respuestaIA || "Entiendo, eso es molesto 😞"}\n\nYa tienes un reporte de soporte abierto. Nuestro equipo técnico lo está revisando.`
-                );
-            } else {
-                const ref = await db.collection("support_tickets").add({
-                    clienteId: cliente.id, clienteNombre: cliente.nombre,
-                    clienteTelefono: cliente.telefono, clienteDireccion: cliente.direccion || "",
-                    tipo: "soporte", descripcion: textoOriginal, estado: "abierto",
-                    prioridad: "media", fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
-                });
-                await botResponder(cliente.telefono,
-                    `${respuestaIA || "Entiendo tu situación 🛠️"}\n\nCreé un reporte técnico (ticket #${ref.id.slice(0, 5)}). Un técnico lo revisará y te contactará pronto.`
-                );
-            }
+        case "soporte":
+            await crearTicket(cliente, "soporte", textoOriginal, respuestaIA);
             break;
-        }
 
-        case "pqr": {
-            const existentePqr = await db.collection("support_tickets")
-                .where("clienteId", "==", cliente.id)
-                .where("tipo", "==", "pqr")
-                .where("estado", "==", "abierto").get();
-            if (!existentePqr.empty) {
-                await botResponder(cliente.telefono,
-                    `${respuestaIA || "Lamento que estés pasando por esto."}\n\nYa tienes un caso de PQR abierto. Lo estamos gestionando.`
-                );
-            } else {
-                const ref = await db.collection("support_tickets").add({
-                    clienteId: cliente.id, clienteNombre: cliente.nombre,
-                    clienteTelefono: cliente.telefono, clienteDireccion: cliente.direccion || "",
-                    tipo: "pqr", descripcion: textoOriginal, estado: "abierto",
-                    prioridad: "alta", fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
-                });
-                await botResponder(cliente.telefono,
-                    `${respuestaIA || "Entiendo tu inconformidad y la tomamos muy en serio."}\n\nRadiqué tu PQR (caso #${ref.id.slice(0, 5)}). La administración lo revisará.`
-                );
-            }
+        case "pqr":
+            await crearTicket(cliente, "pqr", textoOriginal, respuestaIA);
             break;
-        }
 
         default:
             // Saludo o cualquier otro mensaje — la IA ya generó una respuesta natural
@@ -891,26 +876,539 @@ function calcularDeudaCliente(cliente) {
     return { totalDebt, monthsStr: months.slice(0, 3).join(", ") + (months.length > 3 ? "..." : "") };
 }
 
-async function crearTicket(cliente, tipo, descripcion) {
+async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
+    // Anti-duplicado: no crear si ya hay ticket abierto del mismo tipo para este cliente
     const existing = await db.collection("support_tickets")
         .where("clienteId", "==", cliente.id)
         .where("tipo", "==", tipo)
         .where("estado", "==", "abierto").get();
     if (!existing.empty) {
-        await botResponder(cliente.telefono, "⚠️ Ya tienes un caso abierto. Estamos trabajando en ello.");
+        await botResponder(cliente.telefono,
+            `${mensajeIA || "Entendido."}\n\n⚠️ Ya tienes un caso abierto (tipo: ${tipo}). Nuestro equipo lo está atendiendo.`
+        );
         return;
     }
+
+    // Auto-asignación: técnico con menos tickets abiertos
+    let tecnicoAsignado = null;
+    try {
+        const [techSnap, openSnap] = await Promise.all([
+            db.collection("user_profiles").where("role", "==", "tecnico").get(),
+            db.collection("support_tickets").where("estado", "==", "abierto").get(),
+        ]);
+        if (!techSnap.empty) {
+            const carga = {};
+            openSnap.docs.forEach(d => {
+                const tid = d.data().tecnicoAsignado?.id;
+                if (tid) carga[tid] = (carga[tid] || 0) + 1;
+            });
+            const candidato = techSnap.docs
+                .map(d => ({ id: d.id, ...d.data(), carga: carga[d.id] || 0 }))
+                .sort((a, b) => a.carga - b.carga)[0];
+            if (candidato) {
+                tecnicoAsignado = {
+                    id: candidato.id,
+                    nombre: candidato.displayName || candidato.name || "Técnico",
+                    telefono: candidato.phone || candidato.telefono || "",
+                    carga: candidato.carga,
+                };
+            }
+        }
+    } catch (e) {
+        console.error("[crearTicket] Error al asignar técnico:", e.message);
+    }
+
     const ref = await db.collection("support_tickets").add({
         clienteId: cliente.id, clienteNombre: cliente.nombre,
         clienteTelefono: cliente.telefono, clienteDireccion: cliente.direccion || "Sin dirección",
         tipo, descripcion, estado: "abierto",
         prioridad: tipo === "pqr" ? "alta" : "media",
+        tecnicoAsignado,
         fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
     });
-    await botResponder(cliente.telefono, tipo === "soporte"
-        ? `🛠️ *Reporte Creado*\nTicket #${ref.id.slice(0,5)}\nTécnicos notificados.`
-        : `📝 *PQR Radicada*\nTicket #${ref.id.slice(0,5)}\nEscalado a administración.`
-    );
+
+    const ticketId = ref.id.slice(0, 5).toUpperCase();
+
+    // Notificar al técnico asignado si tiene número registrado
+    if (tecnicoAsignado?.telefono) {
+        try {
+            await botResponder(
+                normalizePhone(tecnicoAsignado.telefono),
+                `🔔 *Nuevo ticket asignado*\n\nCliente: *${cliente.nombre}*\n📍 ${cliente.direccion || "Sin dirección"}\nTipo: ${tipo}\nID: #${ticketId}\n\nDescripción:\n"${descripcion.slice(0, 150)}"`
+            );
+        } catch (e) { /* Notificación opcional — no bloquear */ }
+    }
+
+    if (tipo === "soporte") {
+        await botResponder(cliente.telefono,
+            `${mensajeIA || "Entendido, registré tu caso 🛠️"}\n\nTicket #${ticketId} creado. Un técnico te contactará pronto.\n${tecnicoAsignado ? `👷 Asignado a: *${tecnicoAsignado.nombre}*` : ""}`
+        );
+    } else {
+        await botResponder(cliente.telefono,
+            `${mensajeIA || "Lamento la inconformidad. La tomaremos muy en serio 📝"}\n\nPQR #${ticketId} radicada. Administración la revisará.`
+        );
+    }
+}
+
+// ==========================================
+// CONSULTAS DE SISTEMA — STAFF INTERNO
+// admin / cobrador / tecnico pueden consultar
+// el sistema enviando mensajes de WhatsApp al bot.
+// ==========================================
+async function manejarConsultaStaff(phone, texto, staffMember) {
+    const empresa = process.env.NOMBRE_EMPRESA || "el ISP";
+    const rol     = staffMember.role;
+    const nombre  = staffMember.displayName || staffMember.name || "Staff";
+
+    // ── Técnico: manejar flujo de seguimiento de tickets primero ─────────────
+    if (rol === "tecnico") {
+        const handled = await manejarRespuestaTecnico(phone, texto, nombre);
+        if (handled) return;
+    }
+
+    // ── Clasificar intención con Gemini ──────────────────────────────────────
+    let intent = "otro";
+    let parametro = "";
+    try {
+        const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
+        const result = await model.generateContent(
+            `Eres el clasificador de consultas internas de ${empresa}.
+Un empleado (rol: ${rol}) envió: "${texto}"
+
+Clasifica en UNO de estos intents:
+- clientes_mora: cuántos/quiénes deben, mora, deudas
+- tickets_abiertos: tickets, casos, soporte abierto, técnicos
+- pagos_pendientes: comprobantes por aprobar, pagos en espera
+- buscar_cliente: busca a un cliente específico por nombre o teléfono (info general)
+- historial_pagos: pagos, abonos, comprobantes o historial de un cliente específico
+- tecnico_carga: carga de trabajo por técnico, quién tiene más tickets
+- resumen: resumen general, estadísticas, cómo vamos hoy
+- otro: cualquier otra cosa
+
+Si el intent es buscar_cliente o historial_pagos, extrae el nombre o teléfono buscado en "parametro".
+
+Responde SOLO JSON: {"intent":"<valor>","parametro":"<cadena o vacío>"}`
+        );
+        const raw = result.response.text().replace(/```json|```/gi, "").trim();
+        const m   = raw.match(/\{[\s\S]*\}/);
+        if (m) { const p = JSON.parse(m[0]); intent = p.intent || "otro"; parametro = p.parametro || ""; }
+    } catch { /* usa intent=otro */ }
+
+    const fmt = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
+
+    // ── Ejecutar según intent ────────────────────────────────────────────────
+    try {
+        switch (intent) {
+
+            case "clientes_mora": {
+                const snap = await db.collection("clients").get();
+                let totalMora = 0, count = 0, criticos = 0;
+                snap.forEach(d => {
+                    const c = d.data();
+                    let debt = 0;
+                    if (c.pagos) {
+                        Object.entries(c.pagos).forEach(([, meses]) => {
+                            Object.values(meses).forEach(m => {
+                                const d2 = m.debt || c.pago || 0;
+                                const paid = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge").reduce((s, p) => s + p.amount, 0);
+                                if (paid < d2) { debt += (d2 - paid); }
+                            });
+                        });
+                    }
+                    if (debt > 0) { count++; totalMora += debt; if (debt > (c.pago || 0) * 2) criticos++; }
+                });
+                await botResponder(phone,
+                    `📊 *Clientes en mora — ${empresa}*\n\n👥 Total en mora: *${count}*\n🔴 Mora crítica (+2 meses): *${criticos}*\n💰 Cartera total: *${fmt(totalMora)}*\n\nPara ver un cliente específico escribe su nombre o teléfono.`
+                );
+                break;
+            }
+
+            case "tickets_abiertos": {
+                const snap = await db.collection("support_tickets").where("estado", "==", "abierto").get();
+                const tickets = snap.docs.map(d => d.data());
+                const porTecnico = {};
+                tickets.forEach(t => {
+                    const tec = t.tecnicoAsignado?.nombre || "Sin asignar";
+                    porTecnico[tec] = (porTecnico[tec] || 0) + 1;
+                });
+                const ranking = Object.entries(porTecnico).sort((a, b) => b[1] - a[1]).slice(0, 5);
+                const rankStr = ranking.map(([n, c]) => `  • ${n}: ${c} ticket${c !== 1 ? "s" : ""}`).join("\n");
+                await botResponder(phone,
+                    `🎫 *Tickets abiertos — ${empresa}*\n\nTotal: *${tickets.length}*\n\n👷 Por técnico:\n${rankStr || "  (Sin datos)"}\n\nEscribe "detalle tickets" para ver la lista completa.`
+                );
+                break;
+            }
+
+            case "pagos_pendientes": {
+                const snap = await db.collection("pagos_preaprobados").where("status", "==", "pending").get();
+                const pagos = snap.docs.map(d => d.data());
+                const totalMonto = pagos.reduce((s, p) => s + (p.extractedAmount || 0), 0);
+                const lista = pagos.slice(0, 5).map(p => `  • ${p.senderName}: ${fmt(p.extractedAmount)}`).join("\n");
+                await botResponder(phone,
+                    `💳 *Comprobantes por aprobar — ${empresa}*\n\nPendientes: *${pagos.length}*\nMonto total: *${fmt(totalMonto)}*\n\nÚltimos recibidos:\n${lista || "  (Ninguno)"}`
+                );
+                break;
+            }
+
+            case "buscar_cliente": {
+                if (!parametro) { await botResponder(phone, "¿A quién buscas? Escribe el nombre o teléfono del cliente."); break; }
+                const termLower = parametro.toLowerCase();
+                const snap = await db.collection("clients").get();
+                const matches = snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(c =>
+                    (c.nombre && c.nombre.toLowerCase().includes(termLower)) ||
+                    (c.telefono && c.telefono.replace(/\D/g,"").includes(parametro.replace(/\D/g,"")))
+                ).slice(0, 3);
+                if (matches.length === 0) {
+                    await botResponder(phone, `🔍 No encontré clientes que coincidan con "*${parametro}*".`);
+                } else {
+                    const info = matches.map(c => {
+                        const { totalDebt } = calcularDeudaCliente(c);
+                        return `👤 *${c.nombre}*\n  📱 ${c.telefono || "S/N"}\n  💰 Deuda: ${totalDebt > 0 ? fmt(totalDebt) : "Al día ✓"}\n  📍 ${c.direccion || "Sin dirección"}`;
+                    }).join("\n\n");
+                    await botResponder(phone, `🔍 *Resultado para "${parametro}":*\n\n${info}`);
+                }
+                break;
+            }
+
+            case "tecnico_carga": {
+                const [techSnap, tickSnap] = await Promise.all([
+                    db.collection("user_profiles").where("role", "==", "tecnico").get(),
+                    db.collection("support_tickets").where("estado", "==", "abierto").get(),
+                ]);
+                const tickets = tickSnap.docs.map(d => d.data());
+                const carga = {};
+                tickets.forEach(t => { const n = t.tecnicoAsignado?.nombre || "Sin asignar"; carga[n] = (carga[n] || 0) + 1; });
+                const tecnicos = techSnap.docs.map(d => {
+                    const td = d.data();
+                    const n  = td.displayName || td.name || "Técnico";
+                    return `  • ${n}: *${carga[n] || 0}* ticket${carga[n] !== 1 ? "s" : ""}`;
+                });
+                const sinAsignar = carga["Sin asignar"] || 0;
+                await botResponder(phone,
+                    `👷 *Carga de técnicos — ${empresa}*\n\n${tecnicos.join("\n") || "  Sin técnicos registrados"}\n${sinAsignar > 0 ? `\n⚠️ Sin asignar: *${sinAsignar}*` : ""}`
+                );
+                break;
+            }
+
+            case "resumen": {
+                const [clientsSnap, ticketsSnap, pagosSnap] = await Promise.all([
+                    db.collection("clients").get(),
+                    db.collection("support_tickets").where("estado", "==", "abierto").get(),
+                    db.collection("pagos_preaprobados").where("status", "==", "pending").get(),
+                ]);
+                let mora = 0;
+                clientsSnap.forEach(d => {
+                    const c = d.data(); let debt = 0;
+                    if (c.pagos) Object.values(c.pagos).forEach(meses => Object.values(meses).forEach(m => {
+                        const d2 = m.debt || c.pago || 0;
+                        const paid = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge").reduce((s, p) => s + p.amount, 0);
+                        if (paid < d2) debt += (d2 - paid);
+                    }));
+                    if (debt > 0) mora++;
+                });
+                const fecha = new Date().toLocaleDateString("es-CO", { weekday:"long", day:"numeric", month:"long" });
+                await botResponder(phone,
+                    `📈 *Resumen ${empresa}*\n_${fecha}_\n\n👥 Clientes totales: *${clientsSnap.size}*\n🔴 En mora: *${mora}*\n🎫 Tickets abiertos: *${ticketsSnap.size}*\n💳 Pagos por aprobar: *${pagosSnap.size}*\n\nHola ${nombre} 👋 ¿En qué más te ayudo?`
+                );
+                break;
+            }
+
+            case "historial_pagos": {
+                if (!parametro) {
+                    await botResponder(phone, "¿De qué cliente quieres ver los pagos? Escribe su nombre o teléfono.");
+                    break;
+                }
+                const termLower2 = parametro.toLowerCase();
+                const snapH = await db.collection("clients").get();
+                const clienteH = snapH.docs
+                    .map(d => ({ id: d.id, ...d.data() }))
+                    .find(c =>
+                        (c.nombre && c.nombre.toLowerCase().includes(termLower2)) ||
+                        (c.telefono && c.telefono.replace(/\D/g, "").includes(parametro.replace(/\D/g, "")))
+                    );
+                if (!clienteH) {
+                    await botResponder(phone, `🔍 No encontré un cliente con "*${parametro}*".`);
+                    break;
+                }
+                const MESES_N = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+                const pagosLineas = [];
+                let deudaTotal = 0;
+                if (clienteH.pagos) {
+                    const años = Object.keys(clienteH.pagos).sort((a, b) => b - a);
+                    for (const año of años) {
+                        const meses = Object.keys(clienteH.pagos[año]).sort((a, b) => b - a);
+                        for (const mes of meses) {
+                            const m = clienteH.pagos[año][mes];
+                            const deuda = m.debt || clienteH.pago || 0;
+                            const abonos = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge");
+                            const pagado = abonos.reduce((s, p) => s + p.amount, 0);
+                            const saldo = deuda - pagado;
+                            if (saldo > 0) deudaTotal += saldo;
+                            const estadoStr = saldo <= 0 ? "✅ Pagado" : pagado > 0 ? `⚠️ Parcial (falta ${fmt(saldo)})` : `🔴 Sin pagar`;
+                            pagosLineas.push(`  • *${MESES_N[mes]} ${año}*: ${estadoStr}`);
+                            abonos.forEach(p => {
+                                const d = p.date ? new Date(p.date).toLocaleDateString("es-CO") : "";
+                                pagosLineas.push(`    ↳ ${fmt(p.amount)} el ${d}${p.method ? ` (${p.method})` : ""}`);
+                            });
+                            if (pagosLineas.length > 20) break; // limitar salida
+                        }
+                        if (pagosLineas.length > 20) break;
+                    }
+                }
+                const resumenPagos = pagosLineas.length > 0
+                    ? pagosLineas.join("\n")
+                    : "  Sin registros de pago.";
+                await botResponder(phone,
+                    `💳 *Historial de pagos — ${clienteH.nombre}*\n📱 ${clienteH.telefono || "S/N"}\n📍 ${clienteH.direccion || "Sin dirección"}\n\n${resumenPagos}\n\n💰 *Deuda actual: ${deudaTotal > 0 ? fmt(deudaTotal) : "Al día ✓"}*`
+                );
+                break;
+            }
+
+            default:
+                await botResponder(phone,
+                    `Hola ${nombre} 👋\n\nPuedes consultarme:\n• *clientes en mora*\n• *tickets abiertos*\n• *pagos pendientes*\n• *carga de técnicos*\n• *buscar [nombre cliente]*\n• *pagos de [nombre cliente]*\n• *resumen*`
+                );
+        }
+    } catch (e) {
+        console.error("[STAFF] Error en consulta:", e.message);
+        await botResponder(phone, "❌ Error al consultar el sistema. Intenta de nuevo.");
+    }
+}
+
+// ==========================================
+// ESTADO DE CONVERSACIÓN — STAFF
+// Persiste en Firestore: staff_states/{phone}
+// ==========================================
+async function getStaffState(phone) {
+    const snap = await db.collection("staff_states").doc(phone).get();
+    if (!snap.exists) return null;
+    const data = snap.data();
+    // Expirar estados viejos (+24h)
+    if (data.expiresAt && data.expiresAt.toMillis() < Date.now()) {
+        await db.collection("staff_states").doc(phone).delete();
+        return null;
+    }
+    return data;
+}
+
+async function setStaffState(phone, state) {
+    await db.collection("staff_states").doc(phone).set({
+        ...state,
+        expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + 24 * 60 * 60 * 1000),
+    });
+}
+
+async function clearStaffState(phone) {
+    await db.collection("staff_states").doc(phone).delete().catch(() => {});
+}
+
+// ==========================================
+// RECORDATORIO DE TICKETS — TÉCNICOS
+// Envía a cada técnico sus tickets abiertos
+// y pide confirmación de estado uno a uno.
+// ==========================================
+async function recordarTecnicos() {
+    console.log("[RECORDATORIO] Iniciando recordatorio de tickets a técnicos...");
+    try {
+        const [techSnap, ticketSnap] = await Promise.all([
+            db.collection("user_profiles").where("role", "==", "tecnico").get(),
+            db.collection("support_tickets").where("estado", "==", "abierto").get(),
+        ]);
+
+        if (techSnap.empty || ticketSnap.empty) return;
+
+        const empresa = process.env.NOMBRE_EMPRESA || "el ISP";
+
+        // Agrupar tickets por técnico (por id del técnico asignado)
+        const ticketsPorTecnico = {};
+        ticketSnap.docs.forEach(d => {
+            const t = { id: d.id, ...d.data() };
+            const tid = t.tecnicoAsignado?.id;
+            if (!tid) return;
+            if (!ticketsPorTecnico[tid]) ticketsPorTecnico[tid] = [];
+            ticketsPorTecnico[tid].push(t);
+        });
+
+        for (const techDoc of techSnap.docs) {
+            const tec = { id: techDoc.id, ...techDoc.data() };
+            const phone = normalizePhone(tec.phone || tec.telefono || "");
+            if (!phone || phone.length < 10) continue;
+
+            const misTickets = (ticketsPorTecnico[tec.id] || [])
+                .sort((a, b) => {
+                    const ta = a.fechaCreacion?.toMillis?.() || 0;
+                    const tb = b.fechaCreacion?.toMillis?.() || 0;
+                    return ta - tb; // más antiguos primero
+                });
+
+            if (misTickets.length === 0) continue;
+
+            // Verificar que no tenga ya un estado activo (no interrumpir flujo en curso)
+            const existing = await getStaffState(phone);
+            if (existing) continue;
+
+            const nombre = tec.displayName || tec.name || "Técnico";
+            const listaStr = misTickets.slice(0, 5).map((t, i) => {
+                const dias = t.fechaCreacion
+                    ? Math.floor((Date.now() - t.fechaCreacion.toMillis()) / 86400000)
+                    : "?";
+                return `  ${i + 1}. [#${t.id.slice(0, 5).toUpperCase()}] *${t.clienteNombre || "Cliente"}*\n     📍 ${t.clienteDireccion || "Sin dirección"}\n     🕐 Hace ${dias} día${dias !== 1 ? "s" : ""}`;
+            }).join("\n\n");
+
+
+            // Guardar estado: cola de tickets a revisar
+            const pendingIds = misTickets.map(t => t.id);
+            await setStaffState(phone, {
+                stage: "tecnico_confirmar",
+                ticketId: pendingIds[0],
+                ticketDesc: misTickets[0].descripcion || "",
+                clienteNombre: misTickets[0].clienteNombre || "",
+                clienteTelefono: misTickets[0].clienteTelefono || "",
+                pendingIds,
+            });
+
+            await botResponder(phone,
+                `🔔 *Recordatorio de tickets — ${empresa}*\n\nHola *${nombre}*, tienes *${misTickets.length}* ticket${misTickets.length !== 1 ? "s" : ""} abierto${misTickets.length !== 1 ? "s" : ""}:\n\n${listaStr}\n\nEmpecemos por el más antiguo:\n\n🎫 Ticket *#${pendingIds[0].slice(0, 5).toUpperCase()}*\nCliente: *${misTickets[0].clienteNombre || "Desconocido"}*\nProblema: _"${(misTickets[0].descripcion || "").slice(0, 120)}"_\n\n¿Ya lo resolviste? Responde *sí* o *no*`
+            );
+        }
+        console.log("[RECORDATORIO] Completado.");
+    } catch (e) {
+        console.error("[RECORDATORIO] Error:", e.message);
+    }
+}
+
+// Maneja la respuesta del técnico cuando tiene un estado de seguimiento activo
+async function manejarRespuestaTecnico(phone, texto, nombre) {
+    const state = await getStaffState(phone);
+    if (!state || !state.stage?.startsWith("tecnico_")) return false; // no hay estado activo
+
+    const textoNorm = texto.toLowerCase().trim();
+    const fmt = (id) => id.slice(0, 5).toUpperCase();
+
+    // ── Etapa: esperando sí/no ────────────────────────────────────────────────
+    if (state.stage === "tecnico_confirmar") {
+        const esSi  = /^(s[ií]|yes|resuelto|listo|ok|ya|arregl)/i.test(textoNorm);
+        const esNo  = /^(no|todav|pend|aún|aun|sin|falt)/i.test(textoNorm);
+
+        if (esSi) {
+            await setStaffState(phone, { ...state, stage: "tecnico_descripcion" });
+            await botResponder(phone,
+                `✅ ¡Excelente! ¿Cómo lo resolviste?\n\nEscribe una breve descripción de la solución para registrarla en el ticket *#${fmt(state.ticketId)}* (cliente: ${state.clienteNombre}).`
+            );
+            return true;
+        }
+
+        if (esNo) {
+            await setStaffState(phone, { ...state, stage: "tecnico_motivo" });
+            await botResponder(phone,
+                `⏳ Entendido. ¿Por qué sigue pendiente el ticket *#${fmt(state.ticketId)}*?\n\nEscribe el motivo brevemente (ej: "esperando repuesto", "cliente no estaba", etc.)`
+            );
+            return true;
+        }
+
+        // Respuesta no reconocida
+        await botResponder(phone, `No entendí tu respuesta. Para el ticket *#${fmt(state.ticketId)}* (${state.clienteNombre}) responde *sí* si ya lo resolviste o *no* si está pendiente.`);
+        return true;
+    }
+
+    // ── Etapa: escribió la descripción de resolución ──────────────────────────
+    if (state.stage === "tecnico_descripcion") {
+        if (texto.length < 5) {
+            await botResponder(phone, "Por favor escribe una descripción más completa de cómo resolviste el caso.");
+            return true;
+        }
+        // Cerrar ticket en Firestore
+        try {
+            await db.collection("support_tickets").doc(state.ticketId).set({
+                estado: "cerrado",
+                resolucion: texto.trim(),
+                resolvedBy: nombre,
+                fechaCierre: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+
+            // Notificar al cliente si tiene teléfono
+            if (state.clienteTelefono) {
+                const clientePhone = normalizePhone(state.clienteTelefono);
+                botResponder(clientePhone,
+                    `✅ *Caso resuelto*\n\nHola *${state.clienteNombre}*, tu reporte fue atendido:\n\n_"${state.ticketDesc.slice(0, 100)}"_\n\n📝 Resolución: ${texto.trim()}\n\nSi tienes otro problema, no dudes en escribirnos.`
+                ).catch(() => {});
+            }
+        } catch (e) {
+            console.error("[TECNICO] Error cerrando ticket:", e.message);
+        }
+
+        // ¿Hay más tickets en la cola?
+        const remaining = (state.pendingIds || []).slice(1);
+        if (remaining.length > 0) {
+            // Cargar siguiente ticket
+            const nextSnap = await db.collection("support_tickets").doc(remaining[0]).get();
+            const next = nextSnap.exists ? { id: nextSnap.id, ...nextSnap.data() } : null;
+            if (next && next.estado === "abierto") {
+                await setStaffState(phone, {
+                    stage: "tecnico_confirmar",
+                    ticketId: remaining[0],
+                    ticketDesc: next.descripcion || "",
+                    clienteNombre: next.clienteNombre || "",
+                    clienteTelefono: next.clienteTelefono || "",
+                    pendingIds: remaining,
+                });
+                await botResponder(phone,
+                    `✅ Ticket *#${fmt(state.ticketId)}* cerrado. ¡Gracias!\n\nSiguiente:\n\n🎫 Ticket *#${fmt(remaining[0])}*\nCliente: *${next.clienteNombre || "Desconocido"}*\nProblema: _"${(next.descripcion || "").slice(0, 120)}"_\n\n¿Ya lo resolviste? Responde *sí* o *no*`
+                );
+            } else {
+                await clearStaffState(phone);
+                await botResponder(phone, `✅ Ticket *#${fmt(state.ticketId)}* cerrado. ¡Todos tus tickets al día! 🎉`);
+            }
+        } else {
+            await clearStaffState(phone);
+            await botResponder(phone, `✅ Ticket *#${fmt(state.ticketId)}* cerrado. ¡No tienes más tickets pendientes! 🎉`);
+        }
+        return true;
+    }
+
+    // ── Etapa: escribió el motivo de por qué no resolvió ─────────────────────
+    if (state.stage === "tecnico_motivo") {
+        if (texto.length < 3) {
+            await botResponder(phone, "Escribe el motivo por el que no has podido resolver el caso.");
+            return true;
+        }
+        // Guardar comentario en el ticket
+        try {
+            await db.collection("support_tickets").doc(state.ticketId).set({
+                comentarioTecnico: texto.trim(),
+                ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+        } catch (e) { /* no bloquear */ }
+
+        // ¿Hay más tickets?
+        const remaining = (state.pendingIds || []).slice(1);
+        if (remaining.length > 0) {
+            const nextSnap = await db.collection("support_tickets").doc(remaining[0]).get();
+            const next = nextSnap.exists ? { id: nextSnap.id, ...nextSnap.data() } : null;
+            if (next && next.estado === "abierto") {
+                await setStaffState(phone, {
+                    stage: "tecnico_confirmar",
+                    ticketId: remaining[0],
+                    ticketDesc: next.descripcion || "",
+                    clienteNombre: next.clienteNombre || "",
+                    clienteTelefono: next.clienteTelefono || "",
+                    pendingIds: remaining,
+                });
+                await botResponder(phone,
+                    `📝 Registrado. Siguiente ticket:\n\n🎫 Ticket *#${fmt(remaining[0])}*\nCliente: *${next.clienteNombre || "Desconocido"}*\nProblema: _"${(next.descripcion || "").slice(0, 120)}"_\n\n¿Ya lo resolviste? Responde *sí* o *no*`
+                );
+            } else {
+                await clearStaffState(phone);
+                await botResponder(phone, `📝 Motivo registrado. ¡Ya revisamos todos tus tickets! 👍`);
+            }
+        } else {
+            await clearStaffState(phone);
+            await botResponder(phone, `📝 Motivo registrado. No tienes más tickets pendientes por revisar. 👍`);
+        }
+        return true;
+    }
+
+    return false; // estado no reconocido
 }
 
 async function obtenerClientePorTelefono(telefono) {
@@ -1138,7 +1636,7 @@ function auth(req, res, next) {
 
 // ── GET /status ────────────────────────────────────────────────────────────────
 // Incluye el QR como data-URL para que el frontend lo muestre directamente (sin iframe).
-app.get("/status", (req, res) => {
+app.get("/status", (_req, res) => {
     res.json({ connected: isConnected, number: sock?.user?.id || null, hasQR: !!currentQR, qr: currentQR || null });
 });
 
@@ -1163,7 +1661,7 @@ app.post("/logout", auth, async (_req, res) => {
 });
 
 // ── GET /qr ────────────────────────────────────────────────────────────────────
-app.get("/qr", auth, async (req, res) => {
+app.get("/qr", auth, async (_req, res) => {
     if (isConnected) {
         return res.send(`
             <html><body style="font-family:sans-serif;text-align:center;padding:40px">
@@ -1194,6 +1692,18 @@ app.get("/qr", auth, async (req, res) => {
         <script>setTimeout(()=>location.reload(),20000)</script>
         </body></html>
     `);
+});
+
+// ── POST /recordarTecnicos ────────────────────────────────────────────────────
+// Dispara el recordatorio manual (también se llama automáticamente cada día).
+app.post("/recordarTecnicos", auth, async (_req, res) => {
+    try {
+        await recordarTecnicos();
+        res.json({ success: true });
+    } catch (e) {
+        console.error("/recordarTecnicos error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // ── POST /enviarMensajeManual ──────────────────────────────────────────────────
@@ -1229,7 +1739,6 @@ app.post("/confirmarPago", auth, async (req, res) => {
     // 2. Guardar en Firestore (mensaje saliente con la imagen)
     const jid = normalizePhone(telefono);
     const chatRef = db.collection("chats").doc(jid);
-    const fakeMsg = { message: {}, key: msgId ? { id: msgId } : {} };
     const msgPayload = {
         type: "image",
         text: { body: texto },
@@ -1468,6 +1977,14 @@ const server = app.listen(CONFIG.PORT, async () => {
     console.log(`🚀 Servidor Railway corriendo en puerto ${CONFIG.PORT}`);
     console.log(`📱 QR disponible en: /qr`);
     await iniciarWhatsApp();
+
+    // Recordatorio diario a técnicos: cada 24h a partir del arranque.
+    // Para enviar en un horario fijo (ej. 8am) usar una librería de cron.
+    const RECORDATORIO_INTERVALO = 24 * 60 * 60 * 1000; // 24 horas
+    setInterval(() => {
+        recordarTecnicos().catch(e => console.error("[RECORDATORIO CRON]", e.message));
+    }, RECORDATORIO_INTERVALO);
+    console.log("⏰ Recordatorio automático de tickets configurado (cada 24h)");
 });
 
 // Cierre limpio cuando Railway envía SIGTERM (redeploy / stop)
