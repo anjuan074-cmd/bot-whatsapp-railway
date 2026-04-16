@@ -436,7 +436,35 @@ async function procesarMensajeEntrante(message) {
     const isStaff = !!staffMember;
 
     if (isStaff) {
-        const texto = (message.message?.conversation || message.message?.extendedTextMessage?.text || "").trim();
+        const texto = (
+            message.message?.conversation ||
+            message.message?.extendedTextMessage?.text ||
+            message.message?.imageMessage?.caption ||
+            ""
+        ).trim();
+
+        // Si hay imagen Y hay un estado gasto_recibo activo → delegar con buffer
+        if (isImgMsg && imageBuffer) {
+            const staffStateSnap = await db.collection("staff_states").doc(userPhone).get();
+            const staffStage = staffStateSnap.exists ? (staffStateSnap.data().stage || "") : "";
+            if (staffStage === "gasto_recibo") {
+                // Subir imagen a Storage en carpeta receipts/
+                let receiptUrl = null;
+                try {
+                    const bucket   = admin.storage().bucket();
+                    const fileName = `receipts/${userPhone}_${Date.now()}.jpg`;
+                    const file     = bucket.file(fileName);
+                    await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
+                    await file.makePublic();
+                    receiptUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+                } catch (e) {
+                    console.error("[IMG] Error subiendo recibo de gasto:", e.message);
+                }
+                await manejarConsultaStaff(userPhone, "__imagen_recibo__", staffMember, receiptUrl);
+                return;
+            }
+        }
+
         if (texto) await manejarConsultaStaff(userPhone, texto, staffMember);
         return;
     }
@@ -1464,7 +1492,7 @@ async function manejarFlujoCambiarEstado(phone, texto, nombre, state) {
 }
 
 // ── Flujo: registrar gasto ────────────────────────────────────────────────
-async function manejarFlujoRegistrarGasto(phone, texto, nombre, state) {
+async function manejarFlujoRegistrarGasto(phone, texto, nombre, state, receiptUrl = null) {
     const tn   = texto.toLowerCase().trim();
     const fmt2 = (n) => new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(n);
     if (/^(cancelar|salir|cancel)$/i.test(tn)) {
@@ -1498,7 +1526,8 @@ async function manejarFlujoRegistrarGasto(phone, texto, nombre, state) {
         if (!/^(s[ií]|yes|ok|listo|confirmo)$/i.test(tn)) {
             await botResponder(phone,"Responde *sí* para registrar o *cancelar*."); return true;
         }
-        await db.collection("expenses").add({
+        // Guardar ID del documento para luego adjuntar el recibo
+        const docRef = await db.collection("expenses").add({
             type:        state.tipo||"out",
             amount:      state.monto,
             description: state.descripcion||state.categoria,
@@ -1508,10 +1537,41 @@ async function manejarFlujoRegistrarGasto(phone, texto, nombre, state) {
             user:        nombre,
             source:      "bot",
         });
-        await clearStaffState(phone);
-        await botResponder(phone, `✅ *${state.tipo==="in"?"Ingreso":"Gasto"} registrado*\n💵 ${fmt2(state.monto)} | ${state.categoria}\n_Por ${nombre}_`);
+        // Ir al estado de esperar recibo
+        await setStaffState(phone, {
+            ...state,
+            stage:    "gasto_recibo",
+            expenseId: docRef.id,
+        });
+        await botResponder(phone,
+            `✅ *${state.tipo==="in"?"Ingreso":"Gasto"} registrado*\n💵 ${fmt2(state.monto)} | ${state.categoria}\n_Por ${nombre}_\n\n📸 ¿Tienes el recibo o foto de la factura? Envíala ahora.\nO escribe *omitir* si no tienes.`
+        );
         return true;
     }
+
+    if (state.stage === "gasto_recibo") {
+        // Caso 1: llegó imagen (receiptUrl ya viene subido desde el handler principal)
+        if (texto === "__imagen_recibo__") {
+            if (receiptUrl) {
+                await db.collection("expenses").doc(state.expenseId).update({ receiptUrl });
+                await clearStaffState(phone);
+                await botResponder(phone, `📎 Recibo guardado correctamente.\n_El comprobante quedó adjunto al gasto._`);
+            } else {
+                await botResponder(phone, "❌ No pude guardar la imagen. Intenta enviarla de nuevo o escribe *omitir*.");
+            }
+            return true;
+        }
+        // Caso 2: omitir
+        if (/^(omitir|no|sin recibo|skip)$/i.test(tn)) {
+            await clearStaffState(phone);
+            await botResponder(phone, "👌 Gasto guardado sin recibo.");
+            return true;
+        }
+        // Cualquier otro texto → recordar
+        await botResponder(phone, "📸 Envía la *foto del recibo* o escribe *omitir* para continuar sin adjuntarlo.");
+        return true;
+    }
+
     return false;
 }
 
@@ -1569,7 +1629,7 @@ async function manejarFlujoCrearCliente(phone, texto, nombre, state) {
 }
 
 
-async function manejarConsultaStaff(phone, texto, staffMember) {
+async function manejarConsultaStaff(phone, texto, staffMember, receiptUrl = null) {
     const empresa  = process.env.NOMBRE_EMPRESA || "el ISP";
     const rol      = staffMember.role;
     const nombre   = staffMember.displayName || staffMember.name || "Staff";
@@ -1589,7 +1649,7 @@ async function manejarConsultaStaff(phone, texto, staffMember) {
     if (stage.startsWith("agregar_") ||
         stage.startsWith("eliminar_"))         { if (await manejarFlujoAgregar(phone, texto, nombre, staffState))         return; }
     if (stage.startsWith("estado_"))           { if (await manejarFlujoCambiarEstado(phone, texto, nombre, staffState))   return; }
-    if (stage.startsWith("gasto_"))            { if (await manejarFlujoRegistrarGasto(phone, texto, nombre, staffState))  return; }
+    if (stage.startsWith("gasto_"))            { if (await manejarFlujoRegistrarGasto(phone, texto, nombre, staffState, receiptUrl))  return; }
     if (stage.startsWith("cliente_"))          { if (await manejarFlujoCrearCliente(phone, texto, nombre, staffState))    return; }
 
     // ── Historial de conversación ─────────────────────────────────────────────
