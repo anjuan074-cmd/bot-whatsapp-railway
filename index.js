@@ -954,15 +954,15 @@ async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
 // CONSULTAS DE SISTEMA — STAFF INTERNO
 // admin / cobrador / tecnico pueden consultar
 // el sistema enviando mensajes de WhatsApp al bot.
+// La IA entiende lenguaje natural: no se necesitan comandos específicos.
 // ==========================================
 
-// Busca un cliente por nombre parcial o teléfono (utilidad compartida)
+// ── Busca cliente por nombre parcial o teléfono ────────────────────────────
 async function buscarClienteEnDB(parametro) {
-    const lower   = parametro.toLowerCase().trim();
-    const digits  = parametro.replace(/\D/g, "");
-    const snap    = await db.collection("clients").get();
-    const todos   = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    // Exacto primero, luego parcial
+    const lower  = parametro.toLowerCase().trim();
+    const digits = parametro.replace(/\D/g, "");
+    const snap   = await db.collection("clients").get();
+    const todos  = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     return (
         todos.find(c => c.nombre && c.nombre.toLowerCase() === lower) ||
         todos.find(c =>
@@ -970,6 +970,33 @@ async function buscarClienteEnDB(parametro) {
             (digits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(digits))
         ) || null
     );
+}
+
+// ── Genera respuesta natural con Gemini a partir de datos del sistema ──────
+async function generarRespuestaNatural(preguntaOriginal, datosContexto, nombre, rolLabel, empresa) {
+    try {
+        const model  = genAI.getGenerativeModel({ model: CONFIG.GEMINI_MODEL });
+        const result = await model.generateContent(
+`Eres el asistente interno de ${empresa}. Respóndele a *${nombre}* (${rolLabel}).
+
+Lo que escribió: "${preguntaOriginal}"
+
+Información del sistema para responder:
+${datosContexto}
+
+Reglas:
+- Responde en español colombiano, informal pero profesional
+- Máximo 6 líneas, directo al punto
+- Usa *negritas* para números o nombres importantes
+- Si hay varios ítems, usa viñetas con "•"
+- No digas "Hola" ni repitas el nombre si es una respuesta a datos
+- Si no hay datos suficientes, pregunta naturalmente qué necesita
+- Tono de colega que sabe del sistema, no de robot`
+        );
+        return result.response.text().trim();
+    } catch {
+        return datosContexto || "No pude obtener la información. Intenta de nuevo.";
+    }
 }
 
 // Aplica un pago manual al registro de deuda de un cliente en Firestore
@@ -1096,23 +1123,6 @@ async function manejarFlujoPagoManual(phone, texto, nombre, state) {
     return false;
 }
 
-// Menú de ayuda según rol
-function buildHelpMessage(nombre, rol, empresa) {
-    const base = `Hola *${nombre}* 👋\n\nSoy el asistente de *${empresa}*. Puedes preguntarme:\n\n`;
-    if (rol === "cobrador") {
-        return base +
-            `💰 *Cobros y mora:*\n• "clientes en mora"\n• "buscar [nombre]"\n• "pagos de [nombre]"\n• "zona [barrio]"\n• "registrar pago de [nombre]"\n\n` +
-            `💳 *Pagos:*\n• "pagos pendientes"\n\n` +
-            `📊 *Resumen:*\n• "resumen del día"\n\n` +
-            `📬 *Comunicación:*\n• "envíale mensaje a [nombre]: [texto]"`;
-    }
-    return base +
-        `📊 *General:*\n• "resumen"\n• "clientes en mora"\n• "clientes al día"\n\n` +
-        `🔍 *Clientes:*\n• "buscar [nombre]"\n• "pagos de [nombre]"\n• "zona [barrio]"\n\n` +
-        `💳 *Pagos:*\n• "pagos pendientes"\n• "registrar pago de [nombre]"\n\n` +
-        `🎫 *Soporte:*\n• "tickets abiertos"\n• "carga de técnicos"\n\n` +
-        `📬 *Mensajes:*\n• "envíale mensaje a [nombre]: [texto]"`;
-}
 
 async function manejarConsultaStaff(phone, texto, staffMember) {
     const empresa = process.env.NOMBRE_EMPRESA || "el ISP";
@@ -1174,6 +1184,8 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
     const fmt = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
 
     try {
+        let datosContexto = "";
+
         switch (intent) {
 
             case "clientes_mora": {
@@ -1190,15 +1202,13 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                     );
                     if (debt > 0) { count++; totalMora += debt; if (debt > (c.pago || 0) * 2) criticos++; }
                 });
-                await botResponder(phone,
-                    `📊 *Clientes en mora — ${empresa}*\n\n👥 En mora: *${count}*\n🔴 Mora crítica (≥2 meses): *${criticos}*\n💰 Cartera total: *${fmt(totalMora)}*\n\n💡 Escribe "zona [barrio]" para filtrar por sector, o el nombre del cliente para más detalle.`
-                );
+                datosContexto = `Clientes en mora: ${count} de ${snap.size} total. Mora crítica (≥2 meses): ${criticos}. Cartera total: ${fmt(totalMora)}.`;
                 break;
             }
 
             case "clientes_al_dia": {
                 const snap = await db.collection("clients").get();
-                let alDia = 0, conAbono = 0;
+                let alDia = 0;
                 snap.forEach(d => {
                     const c = d.data(); let debt = 0;
                     if (c.pagos) Object.entries(c.pagos).forEach(([, meses]) =>
@@ -1208,11 +1218,10 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                             if (paid < d2) debt += (d2 - paid);
                         })
                     );
-                    if (debt === 0) { alDia++; if (c.pagos && Object.keys(c.pagos).length > 0) conAbono++; }
+                    if (debt === 0) alDia++;
                 });
-                await botResponder(phone,
-                    `✅ *Clientes al día — ${empresa}*\n\n✅ Sin deuda: *${alDia}* de *${snap.size}* clientes\n📊 Porcentaje: *${snap.size > 0 ? Math.round(alDia / snap.size * 100) : 0}%*`
-                );
+                const pct = snap.size > 0 ? Math.round(alDia / snap.size * 100) : 0;
+                datosContexto = `Clientes al día: ${alDia} de ${snap.size} total (${pct}%). El resto tiene alguna deuda pendiente.`;
                 break;
             }
 
@@ -1221,11 +1230,9 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                 const tickets = snap.docs.map(d => d.data());
                 const porTecnico = {};
                 tickets.forEach(t => { const tec = t.tecnicoAsignado?.nombre || "Sin asignar"; porTecnico[tec] = (porTecnico[tec] || 0) + 1; });
-                const ranking = Object.entries(porTecnico).sort((a, b) => b[1] - a[1]).slice(0, 5);
-                const rankStr = ranking.map(([n, c]) => `  • ${n}: ${c} ticket${c !== 1 ? "s" : ""}`).join("\n");
-                await botResponder(phone,
-                    `🎫 *Tickets abiertos — ${empresa}*\n\nTotal: *${tickets.length}*\n\n👷 Por técnico:\n${rankStr || "  (Sin datos)"}`
-                );
+                const ranking = Object.entries(porTecnico).sort((a, b) => b[1] - a[1]).slice(0, 5)
+                    .map(([n, c]) => `${n}: ${c} ticket${c !== 1 ? "s" : ""}`).join(", ");
+                datosContexto = `Tickets abiertos: ${tickets.length}. Distribución por técnico: ${ranking || "sin datos"}.`;
                 break;
             }
 
@@ -1233,52 +1240,58 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                 const snap  = await db.collection("pagos_preaprobados").where("status", "==", "pending").get();
                 const pagos = snap.docs.map(d => d.data());
                 const total = pagos.reduce((s, p) => s + (p.extractedAmount || 0), 0);
-                const lista = pagos.slice(0, 6).map(p => `  • *${p.senderName || "?"}*: ${fmt(p.extractedAmount || 0)} — ${p.bancoOrigen || "??"}`).join("\n");
-                await botResponder(phone,
-                    `💳 *Comprobantes por aprobar — ${empresa}*\n\nPendientes: *${pagos.length}*\nMonto total: *${fmt(total)}*\n\n${lista || "  (Ninguno pendiente)"}\n\n💡 Apruébalos desde el panel de Soporte.`
-                );
+                const lista = pagos.slice(0, 6).map(p => `${p.senderName || "?"}: ${fmt(p.extractedAmount || 0)} vía ${p.bancoOrigen || "??"}`).join("; ");
+                datosContexto = pagos.length === 0
+                    ? "No hay comprobantes de pago pendientes por aprobar."
+                    : `Comprobantes por aprobar: ${pagos.length}. Monto total: ${fmt(total)}. Detalle: ${lista}. Se aprueban desde el panel de Soporte.`;
                 break;
             }
 
             case "buscar_cliente": {
-                if (!parametro) { await botResponder(phone, "¿A quién buscas? Escribe el nombre o teléfono."); break; }
+                if (!parametro) {
+                    await botResponder(phone, await generarRespuestaNatural(texto, "El empleado no especificó a qué cliente buscar.", nombre, rolLabel, empresa));
+                    return;
+                }
                 const c = await buscarClienteEnDB(parametro);
-                if (!c) { await botResponder(phone, `🔍 No encontré clientes con "*${parametro}*".`); break; }
-                const { totalDebt, monthsStr } = calcularDeudaCliente(c);
-                const estado = c.estado || "activo";
-                const planStr = c.plan ? ` | Plan: ${c.plan}` : "";
-                await botResponder(phone,
-                    `👤 *${c.nombre}*\n📱 ${c.telefono || "Sin teléfono"}\n📍 ${c.direccion || "Sin dirección"}\n🏷️ Estado: ${estado}${planStr}\n\n💰 Deuda: *${totalDebt > 0 ? fmt(totalDebt) : "Al día ✓"}*${totalDebt > 0 ? `\nMeses: ${monthsStr}` : ""}\n\n💡 Escribe "pagos de ${c.nombre}" para ver historial o "registrar pago de ${c.nombre}" para abonar.`
-                );
+                if (!c) {
+                    datosContexto = `No se encontró ningún cliente con el nombre o teléfono "${parametro}" en la base de datos.`;
+                } else {
+                    const { totalDebt, monthsStr } = calcularDeudaCliente(c);
+                    datosContexto = `Cliente encontrado: ${c.nombre}. Teléfono: ${c.telefono || "no registrado"}. Dirección: ${c.direccion || "no registrada"}. Estado: ${c.estado || "activo"}${c.plan ? `. Plan: ${c.plan}` : ""}. Deuda: ${totalDebt > 0 ? `${fmt(totalDebt)} (meses: ${monthsStr})` : "al día, sin deuda"}.`;
+                }
                 break;
             }
 
             case "historial_pagos": {
-                if (!parametro) { await botResponder(phone, "¿De qué cliente? Escribe su nombre o teléfono."); break; }
-                const c = await buscarClienteEnDB(parametro);
-                if (!c) { await botResponder(phone, `🔍 No encontré un cliente con "*${parametro}*".`); break; }
-                const MESES_N = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
-                const lineas = []; let deudaTotal = 0;
-                if (c.pagos) {
-                    for (const año of Object.keys(c.pagos).sort((a, b) => b - a)) {
-                        for (const mes of Object.keys(c.pagos[año]).sort((a, b) => b - a)) {
-                            const m = c.pagos[año][mes];
-                            const deuda = m.debt || c.pago || 0;
-                            const abonos = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge");
-                            const pagado = abonos.reduce((s, p) => s + p.amount, 0);
-                            const saldo  = deuda - pagado;
-                            if (saldo > 0) deudaTotal += saldo;
-                            const est = saldo <= 0 ? "✅ Pagado" : pagado > 0 ? `⚠️ Parcial (falta ${fmt(saldo)})` : `🔴 Sin pagar`;
-                            lineas.push(`  • *${MESES_N[mes]} ${año}*: ${est}`);
-                            abonos.forEach(p => { const d = p.date ? new Date(p.date).toLocaleDateString("es-CO") : ""; lineas.push(`    ↳ ${fmt(p.amount)} el ${d}${p.method ? ` (${p.method})` : ""}`); });
-                            if (lineas.length > 20) break;
-                        }
-                        if (lineas.length > 20) break;
-                    }
+                if (!parametro) {
+                    await botResponder(phone, await generarRespuestaNatural(texto, "El empleado no especificó de qué cliente quiere el historial.", nombre, rolLabel, empresa));
+                    return;
                 }
-                await botResponder(phone,
-                    `💳 *Historial — ${c.nombre}*\n📱 ${c.telefono || "S/N"}\n\n${lineas.length > 0 ? lineas.join("\n") : "  Sin registros."}\n\n💰 *Deuda: ${deudaTotal > 0 ? fmt(deudaTotal) : "Al día ✓"}*`
-                );
+                const c = await buscarClienteEnDB(parametro);
+                if (!c) {
+                    datosContexto = `No se encontró ningún cliente con "${parametro}".`;
+                } else {
+                    const MESES_N = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+                    const lineas = []; let deudaTotal = 0;
+                    if (c.pagos) {
+                        for (const año of Object.keys(c.pagos).sort((a, b) => b - a)) {
+                            for (const mes of Object.keys(c.pagos[año]).sort((a, b) => b - a)) {
+                                const m = c.pagos[año][mes];
+                                const deuda = m.debt || c.pago || 0;
+                                const abonos = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge");
+                                const pagado = abonos.reduce((s, p) => s + p.amount, 0);
+                                const saldo  = deuda - pagado;
+                                if (saldo > 0) deudaTotal += saldo;
+                                const est = saldo <= 0 ? "pagado" : pagado > 0 ? `abono parcial (falta ${fmt(saldo)})` : "sin pagar";
+                                const abonosStr = abonos.map(p => `${fmt(p.amount)} el ${p.date ? new Date(p.date).toLocaleDateString("es-CO") : "fecha N/A"}${p.method ? ` (${p.method})` : ""}`).join(", ");
+                                lineas.push(`${MESES_N[mes]} ${año}: ${est}${abonosStr ? `. Abonos: ${abonosStr}` : ""}`);
+                                if (lineas.length >= 12) break;
+                            }
+                            if (lineas.length >= 12) break;
+                        }
+                    }
+                    datosContexto = `Historial de ${c.nombre} (tel: ${c.telefono || "S/N"}):\n${lineas.length > 0 ? lineas.join("\n") : "Sin registros de pago."}\nDeuda total acumulada: ${deudaTotal > 0 ? fmt(deudaTotal) : "al día"}.`;
+                }
                 break;
             }
 
@@ -1295,7 +1308,7 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                             await botResponder(phone,
                                 `📋 *Confirma el pago manual:*\n\n👤 Cliente: *${c.nombre}*\n💵 Monto: *${fmt(monto)}*\n💰 Deuda actual: *${totalDebt > 0 ? fmt(totalDebt) : "Al día"}*\n👷 Registrado por: *${nombre}*\n\nEscribe *sí* para confirmar o *cancelar* para salir.`
                             );
-                            break;
+                            return;
                         }
                     }
                 }
@@ -1306,44 +1319,59 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                         const { totalDebt } = calcularDeudaCliente(c);
                         await setStaffState(phone, { stage: "pago_manual_monto", clienteId: c.id, clienteNombre: c.nombre, clienteTelefono: c.telefono || "", deudaActual: totalDebt });
                         await botResponder(phone, `👤 Cliente: *${c.nombre}*\n💰 Deuda: *${totalDebt > 0 ? fmt(totalDebt) : "Al día ✓"}*\n\n¿Cuánto vas a registrar? Escribe el monto en pesos.\n\nO escribe *cancelar* para salir.`);
-                        break;
+                        return;
                     }
                 }
                 // Sin parametro útil — iniciar flujo
                 await setStaffState(phone, { stage: "pago_manual_cliente" });
                 await botResponder(phone, `💵 *Registrar pago manual*\n\n¿A qué cliente le vas a registrar el pago?\nEscribe el nombre completo o teléfono.\n\nO escribe *cancelar* para salir.`);
-                break;
+                return;
             }
 
             case "listar_zona": {
-                if (!parametro) { await botResponder(phone, "¿Qué zona o barrio quieres consultar?"); break; }
+                if (!parametro) {
+                    await botResponder(phone, await generarRespuestaNatural(texto, "El empleado preguntó por una zona pero no especificó cuál.", nombre, rolLabel, empresa));
+                    return;
+                }
                 const snap    = await db.collection("clients").get();
                 const zoneLow = parametro.toLowerCase();
                 const lista   = snap.docs
                     .map(d => ({ id: d.id, ...d.data() }))
                     .filter(c => (c.barrio || "").toLowerCase().includes(zoneLow) || (c.direccion || "").toLowerCase().includes(zoneLow));
-                if (lista.length === 0) { await botResponder(phone, `📍 No encontré clientes en la zona "*${parametro}*".`); break; }
-                const enMora = lista.filter(c => { const { totalDebt } = calcularDeudaCliente(c); return totalDebt > 0; });
-                const lineas = enMora.slice(0, 8).map(c => {
-                    const { totalDebt } = calcularDeudaCliente(c);
-                    return `  • *${c.nombre}* — ${fmt(totalDebt)} — 📱 ${c.telefono || "S/N"}`;
-                });
-                await botResponder(phone,
-                    `📍 *Zona "${parametro}" — En mora*\n\nTotal en zona: ${lista.length} | En mora: *${enMora.length}*\n\n${lineas.join("\n") || "  (Ninguno en mora)"}${enMora.length > 8 ? `\n  ... y ${enMora.length - 8} más.` : ""}`
-                );
+                if (lista.length === 0) {
+                    datosContexto = `No se encontraron clientes en la zona "${parametro}".`;
+                } else {
+                    const enMora = lista.filter(c => { const { totalDebt } = calcularDeudaCliente(c); return totalDebt > 0; });
+                    const detalle = enMora.slice(0, 8).map(c => {
+                        const { totalDebt } = calcularDeudaCliente(c);
+                        return `${c.nombre}: ${fmt(totalDebt)} (tel: ${c.telefono || "S/N"})`;
+                    }).join("; ");
+                    datosContexto = `Zona "${parametro}": ${lista.length} clientes en total. En mora: ${enMora.length}. Detalle: ${detalle || "ninguno en mora"}${enMora.length > 8 ? ` (y ${enMora.length - 8} más)` : ""}.`;
+                }
                 break;
             }
 
             case "enviar_mensaje_cliente": {
-                if (!parametro) { await botResponder(phone, `Para enviar un mensaje escribe:\n*envíale a [nombre del cliente]: [tu mensaje]*`); break; }
+                if (!parametro) {
+                    await botResponder(phone, await generarRespuestaNatural(texto, "El empleado quiere enviar un mensaje a un cliente pero no especificó ni el nombre ni el mensaje.", nombre, rolLabel, empresa));
+                    return;
+                }
                 let clienteNom = parametro, mensajeTexto = "";
                 if (parametro.includes("|")) { [clienteNom, mensajeTexto] = parametro.split("|").map(s => s.trim()); }
-                if (!mensajeTexto) { await botResponder(phone, `No entendí el mensaje a enviar. Escribe:\n*envíale mensaje a ${clienteNom}: [el mensaje aquí]*`); break; }
+                if (!mensajeTexto) {
+                    await botResponder(phone, await generarRespuestaNatural(texto, `El empleado quiere enviar mensaje a "${clienteNom}" pero no indicó el texto del mensaje.`, nombre, rolLabel, empresa));
+                    return;
+                }
                 const c = await buscarClienteEnDB(clienteNom);
-                if (!c) { await botResponder(phone, `🔍 No encontré un cliente con "*${clienteNom}*".`); break; }
-                if (!c.telefono) { await botResponder(phone, `⚠️ ${c.nombre} no tiene teléfono registrado.`); break; }
+                if (!c) {
+                    datosContexto = `No se encontró ningún cliente con el nombre "${clienteNom}".`;
+                    break;
+                }
+                if (!c.telefono) {
+                    datosContexto = `El cliente ${c.nombre} existe pero no tiene teléfono registrado, no se puede enviar el mensaje.`;
+                    break;
+                }
                 await botResponder(normalizePhone(c.telefono), mensajeTexto);
-                // Guardar en historial del chat
                 await db.collection("chats").doc(normalizePhone(c.telefono)).set({
                     lastMessage: mensajeTexto,
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
@@ -1351,7 +1379,7 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                     userName: c.nombre,
                     phone: normalizePhone(c.telefono),
                 }, { merge: true });
-                await botResponder(phone, `✅ Mensaje enviado a *${c.nombre}* (${c.telefono}).\n\n_"${mensajeTexto.slice(0, 80)}${mensajeTexto.length > 80 ? "…" : ""}"_`);
+                datosContexto = `Mensaje enviado exitosamente a ${c.nombre} (${c.telefono}). Texto: "${mensajeTexto.slice(0, 100)}${mensajeTexto.length > 100 ? "…" : ""}".`;
                 break;
             }
 
@@ -1365,12 +1393,10 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                 const tecnicos = techSnap.docs.map(d => {
                     const td = d.data();
                     const n  = td.displayName || td.name || "Técnico";
-                    return `  • ${n}: *${carga[n] || 0}* ticket${carga[n] !== 1 ? "s" : ""}`;
+                    return `${n}: ${carga[n] || 0} ticket${carga[n] !== 1 ? "s" : ""}`;
                 });
                 const sinAsignar = carga["Sin asignar"] || 0;
-                await botResponder(phone,
-                    `👷 *Carga de técnicos — ${empresa}*\n\n${tecnicos.join("\n") || "  Sin técnicos registrados"}\n${sinAsignar > 0 ? `\n⚠️ Sin asignar: *${sinAsignar}*` : ""}`
-                );
+                datosContexto = `Carga de técnicos: ${tecnicos.join(", ") || "sin técnicos registrados"}${sinAsignar > 0 ? `. Sin asignar: ${sinAsignar}` : ""}.`;
                 break;
             }
 
@@ -1386,22 +1412,25 @@ Responde SOLO JSON sin texto adicional: {"intent":"<valor>","parametro":"<cadena
                     if (c.pagos) Object.values(c.pagos).forEach(meses => Object.values(meses).forEach(m => {
                         const d2 = m.debt || c.pago || 0;
                         const paid = (m.payments || []).filter(p => p.status !== "voided" && p.type !== "charge").reduce((s, p) => s + p.amount, 0);
-                        if (paid < d2) { debt += (d2 - paid); }
+                        if (paid < d2) debt += (d2 - paid);
                     }));
                     if (debt > 0) { mora++; totalCartera += debt; }
                 });
                 const fecha = new Date().toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long" });
-                await botResponder(phone,
-                    `📈 *Resumen ${empresa}*\n_${fecha}_\n\n👥 Clientes: *${clientsSnap.size}* | En mora: *${mora}*\n💰 Cartera: *${fmt(totalCartera)}*\n🎫 Tickets abiertos: *${ticketsSnap.size}*\n💳 Pagos por aprobar: *${pagosSnap.size}*\n\nHola *${nombre}* 👋 ¿En qué más te ayudo?`
-                );
+                datosContexto = `Resumen del ${fecha}: ${clientsSnap.size} clientes totales, ${mora} en mora, cartera de ${fmt(totalCartera)}. Tickets abiertos: ${ticketsSnap.size}. Comprobantes por aprobar: ${pagosSnap.size}.`;
                 break;
             }
 
-            case "ayuda":
-            default:
-                await botResponder(phone, buildHelpMessage(nombre, rol, empresa));
+            default: {
+                // Sin intent claro — la IA responde naturalmente con lo que tiene
+                datosContexto = `El empleado escribió algo que no corresponde a una consulta específica del sistema. Responde de forma amigable y dile qué tipo de consultas puedes hacer (mora, clientes, tickets, pagos, zonas, registrar pagos, etc.) sin usar un menú numerado.`;
                 break;
+            }
         }
+
+        const respuesta = await generarRespuestaNatural(texto, datosContexto, nombre, rolLabel, empresa);
+        await botResponder(phone, respuesta);
+
     } catch (e) {
         console.error("[STAFF] Error en consulta:", e.message);
         await botResponder(phone, "❌ Error al consultar el sistema. Intenta de nuevo.");
