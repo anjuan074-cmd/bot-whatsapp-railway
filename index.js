@@ -2167,13 +2167,16 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
             // ─── Comprobante: foto Nequi/transferencia que envió el cliente ─────
             case "ver_comprobante": {
                 const termComp = buscar || pagoInfo;
-                if (!termComp) { datosContexto = "No se especificó de qué cliente ver el comprobante."; break; }
-                const c = await buscarClienteEnDB(termComp);
+                if (!termComp) {
+                    await botResponder(phone, "¿De qué cliente quieres ver el comprobante?");
+                    return;
+                }
+                const cComp = await buscarClienteEnDB(termComp);
                 const snapPre = await db.collection("pagos_preaprobados")
                     .orderBy("date", "desc").limit(100).get();
                 const allPre = snapPre.docs.map(d=>({id:d.id,...d.data()}));
-                const matches = c
-                    ? allPre.filter(p => p.clientId === c.id || fuzzyNombre(p.senderName||"", termComp))
+                const matches = cComp
+                    ? allPre.filter(p => p.clientId === cComp.id || fuzzyNombre(p.senderName||"", termComp))
                     : allPre.filter(p => fuzzyNombre(p.senderName||"", termComp));
                 matches.sort((a,b) => (b.date||"").localeCompare(a.date||""));
                 const enviados = [];
@@ -2185,29 +2188,38 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                         enviados.push(p.senderName||"?");
                     }
                 }
-                if (enviados.length) {
-                    return; // imagen ya enviada, no pasar por generarRespuestaNatural
-                }
-                datosContexto = `No se encontraron fotos de comprobante de "${termComp}". Si quieres el recibo oficial usa "generar recibo".`;
-                break;
+                if (enviados.length) return;
+                // No hay foto Nequi — intentar generar recibo oficial directamente
+                await botResponder(phone, `No hay foto de comprobante de "${termComp}". Generando recibo oficial...`);
+                accion = "generar_recibo"; // caer al siguiente case
+                buscar = termComp;
+                // fallthrough intencional
             }
-
-            // ─── Recibo: documento oficial generado por la empresa ────────────
+            // eslint-disable-next-line no-fallthrough
             case "generar_recibo": {
                 const termRec = buscar || pagoInfo;
-                if (!termRec) { datosContexto = "No se especificó para qué cliente generar el recibo."; break; }
-                const c = await buscarClienteEnDB(termRec);
-                if (!c) { datosContexto = `No se encontró el cliente "${termRec}".`; break; }
-                const up = ultimoPago(c);
-                if (!up.monto) { datosContexto = `${c.nombre} no tiene pagos registrados para generar un recibo.`; break; }
+                if (!termRec) {
+                    await botResponder(phone, "¿Para qué cliente quieres generar el recibo?");
+                    return;
+                }
+                const cRec = await buscarClienteEnDB(termRec);
+                if (!cRec) {
+                    await botResponder(phone, `No encontré el cliente "${termRec}".`);
+                    return;
+                }
+                const up = ultimoPago(cRec);
+                if (!up.monto) {
+                    await botResponder(phone, `${cRec.nombre} no tiene pagos registrados para generar un recibo.`);
+                    return;
+                }
                 const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
                 const dt = up.ts ? new Date(up.ts) : new Date();
                 try {
                     const empConf = await db.collection("settings").doc("empresa").get().catch(()=>null);
                     const empData = empConf?.exists ? empConf.data() : {};
                     const imgBuf = generarReciboImagen({
-                        clienteNombre:    c.nombre,
-                        clienteDireccion: c.direccion || c.barrio || "",
+                        clienteNombre:    cRec.nombre,
+                        clienteDireccion: cRec.direccion || cRec.barrio || "",
                         monto:            up.monto,
                         fecha:            dt.toISOString(),
                         metodo:           up.metodo || "Efectivo",
@@ -2216,15 +2228,14 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                         nit:              empData.nit || "",
                         telefono:         empData.telefono || "",
                         cajero:           nombre,
-                        codigoInterno:    c.id ? c.id.slice(0, 8).toUpperCase() : "",
+                        codigoInterno:    cRec.id ? cRec.id.slice(0, 8).toUpperCase() : "",
                     });
-                    const cap = `Recibo de pago | ${c.nombre} | ${fmt(up.monto)} | ${up.fecha || ""}`;
-                    const jid = toJID(phone);
-                    await sock.sendMessage(jid, { image: imgBuf, mimetype: "image/png", caption: cap });
-                    return; // imagen enviada, no pasar por generarRespuestaNatural
+                    const cap = `Recibo de pago | ${cRec.nombre} | ${fmt(up.monto)} | ${up.fecha || ""}`;
+                    await sock.sendMessage(toJID(phone), { image: imgBuf, mimetype: "image/png", caption: cap });
+                    return;
                 } catch (e) {
                     console.error("[RECIBO] Error generando recibo:", e.message);
-                    await botResponder(phone, `No pude generar el recibo de ${c.nombre}: ${e.message}`);
+                    await botResponder(phone, `Error generando el recibo de ${cRec.nombre}: ${e.message}`);
                     return;
                 }
             }
