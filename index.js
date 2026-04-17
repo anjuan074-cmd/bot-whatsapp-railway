@@ -993,30 +993,60 @@ async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
 // La IA entiende lenguaje natural: no se necesitan comandos específicos.
 // ==========================================
 
-// ── Busca UN cliente por nombre parcial o teléfono (flujo de pago manual) ──
+// ── Helpers de búsqueda fuzzy ──────────────────────────────────────────────
+function norm(s) {
+    return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+}
+function levenshtein(a, b) {
+    const dp = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+    for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+    for (let i = 1; i <= a.length; i++)
+        for (let j = 1; j <= b.length; j++)
+            dp[i][j] = Math.min(
+                dp[i-1][j] + 1, dp[i][j-1] + 1,
+                dp[i-1][j-1] + (a[i-1] !== b[j-1] ? 1 : 0)
+            );
+    return dp[a.length][b.length];
+}
+// Devuelve true si cada token del query coincide con algún token del nombre
+// (substring exacto o distancia de edición ≤1 para tokens ≥5 chars)
+function fuzzyNombre(nombre, query) {
+    const nameN  = norm(nombre);
+    const queryN = norm(query);
+    if (nameN.includes(queryN)) return true;
+    const nameTk  = nameN.split(/\s+/);
+    const queryTk = queryN.split(/\s+/);
+    return queryTk.every(qt =>
+        nameTk.some(nt =>
+            nt.includes(qt) || qt.includes(nt) ||
+            (qt.length >= 5 && levenshtein(qt, nt) <= 1)
+        )
+    );
+}
+
+// ── Busca UN cliente por nombre (fuzzy) o teléfono ────────────────────────
 async function buscarClienteEnDB(parametro) {
-    const lower  = parametro.toLowerCase().trim();
     const digits = parametro.replace(/\D/g, "");
     const snap   = await db.collection("clients").get();
     const todos  = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // Exacto primero, luego fuzzy, luego teléfono
     return (
-        todos.find(c => c.nombre && c.nombre.toLowerCase() === lower) ||
+        todos.find(c => norm(c.nombre) === norm(parametro)) ||
         todos.find(c =>
-            (c.nombre && c.nombre.toLowerCase().includes(lower)) ||
+            (c.nombre && fuzzyNombre(c.nombre, parametro)) ||
             (digits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(digits))
         ) || null
     );
 }
 
-// ── Busca TODOS los clientes que coincidan con el término ──────────────────
+// ── Busca TODOS los clientes que coincidan (fuzzy) ────────────────────────
 async function buscarClientesEnDB(parametro) {
-    const lower  = parametro.toLowerCase().trim();
     const digits = parametro.replace(/\D/g, "");
     const snap   = await db.collection("clients").get();
     return snap.docs
         .map(d => ({ id: d.id, ...d.data() }))
         .filter(c =>
-            (c.nombre && c.nombre.toLowerCase().includes(lower)) ||
+            (c.nombre && fuzzyNombre(c.nombre, parametro)) ||
             (digits.length >= 6 && c.telefono && c.telefono.replace(/\D/g,"").includes(digits))
         );
 }
@@ -1966,24 +1996,51 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
             case "ver_comprobante": {
                 const termComp = buscar;
                 if (!termComp) { datosContexto = "No se especificó de qué cliente ver el comprobante."; break; }
-                const snap = await db.collection("pagos_preaprobados")
-                    .orderBy("date", "desc").limit(50).get();
-                const lower = termComp.toLowerCase();
-                const matches = snap.docs.map(d=>({id:d.id,...d.data()}))
-                    .filter(p=>(p.senderName||"").toLowerCase().includes(lower));
-                if (!matches.length) { datosContexto = `No se encontraron comprobantes de "${termComp}".`; break; }
-                // Enviar hasta 3 imágenes directamente
+                const MESES_C = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
                 const enviados = [];
-                for (const p of matches.slice(0,3)) {
-                    if (p.imageUrl) {
-                        const caption = `📋 ${p.senderName||"?"} — ${fmt(p.extractedAmount||0)}\n${p.bancoOrigen||""} | ${p.status==="pending"?"⏳ Pendiente":p.status==="approved"?"✅ Aprobado":"❌ Rechazado"}\n${p.date?new Date(p.date).toLocaleDateString("es-CO"):""}`;
-                        await enviarImagen(phone, p.imageUrl, caption);
-                        enviados.push(p.senderName||"?");
+
+                // 1. Buscar en los pagos YA aprobados del cliente (dentro de pagos[año][mes].payments)
+                const c = await buscarClienteEnDB(termComp);
+                if (c && c.pagos) {
+                    const pagosConImg = [];
+                    for (const yr of Object.keys(c.pagos)) {
+                        for (const mo of Object.keys(c.pagos[yr])) {
+                            for (const p of (c.pagos[yr][mo].payments || [])) {
+                                const imgUrl = p.imageUrl || p.receiptUrl;
+                                if (imgUrl && p.type !== "charge" && p.status !== "voided") {
+                                    pagosConImg.push({ ...p, yr, mo, dateObj: p.date ? new Date(p.date) : new Date(0) });
+                                }
+                            }
+                        }
+                    }
+                    pagosConImg.sort((a, b) => b.dateObj - a.dateObj);
+                    for (const p of pagosConImg.slice(0, 3)) {
+                        const imgUrl = p.imageUrl || p.receiptUrl;
+                        const cap = `📋 ${c.nombre} — ${fmt(p.amount||0)}\n${p.method||""} | ${MESES_C[parseInt(p.mo)]} ${p.yr}`;
+                        await enviarImagen(phone, imgUrl, cap);
+                        enviados.push(`${MESES_C[parseInt(p.mo)]} ${p.yr}`);
                     }
                 }
+
+                // 2. Complementar con pagos_preaprobados (pendientes de aprobación)
+                if (enviados.length < 3) {
+                    const snapPre = await db.collection("pagos_preaprobados")
+                        .orderBy("date", "desc").limit(50).get();
+                    const matchesPre = snapPre.docs.map(d=>({id:d.id,...d.data()}))
+                        .filter(p => fuzzyNombre(p.senderName||"", termComp));
+                    for (const p of matchesPre.slice(0, 3 - enviados.length)) {
+                        if (p.imageUrl) {
+                            const statusLbl = p.status==="pending"?"⏳ Pendiente":p.status==="approved"?"✅ Aprobado":"❌ Rechazado";
+                            const cap = `📋 ${p.senderName||"?"} — ${fmt(p.extractedAmount||0)}\n${p.bancoOrigen||""} | ${statusLbl}\n${p.date?new Date(p.date).toLocaleDateString("es-CO"):""}`;
+                            await enviarImagen(phone, p.imageUrl, cap);
+                            enviados.push(p.senderName||"?");
+                        }
+                    }
+                }
+
                 datosContexto = enviados.length
                     ? `Se enviaron ${enviados.length} comprobante(s) de ${termComp}: ${enviados.join(", ")}.`
-                    : `Los comprobantes de "${termComp}" no tienen imagen guardada.`;
+                    : `No se encontraron comprobantes con imagen de "${termComp}".`;
                 break;
             }
 
