@@ -29,13 +29,19 @@ const crypto    = require("crypto");
 const QRCode    = require("qrcode");
 const admin     = require("firebase-admin");
 const { createCanvas, registerFont } = require("canvas");
-// Registrar fuentes del sistema (DejaVu siempre presente en Railway/Debian)
+// Fuentes bundleadas en el repo — funcionan en Railway y local sin dependencia del SO
+const _fontsDir = require("path").join(__dirname, "fonts");
 try {
-    registerFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",       { family: "DejaVu" });
-    registerFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  { family: "DejaVu", weight: "bold" });
-} catch (_) { /* En local usa fallback del sistema */ }
-const RECEIPT_FONT       = '"DejaVu", "Liberation Sans", Arial, sans-serif';
-const RECEIPT_FONT_BOLD  = 'bold ' + RECEIPT_FONT;
+    registerFont(_fontsDir + "/Arial.ttf",      { family: "Receipt" });
+    registerFont(_fontsDir + "/Arial-Bold.ttf", { family: "Receipt", weight: "bold" });
+} catch (_) {
+    try {
+        registerFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",      { family: "Receipt" });
+        registerFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", { family: "Receipt", weight: "bold" });
+    } catch (__) { /* fallback silencioso */ }
+}
+const RF  = "Receipt, Arial, sans-serif";   // normal
+const RFB = "Receipt, Arial, sans-serif";   // bold (se antepone "bold " al usar)
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const {
@@ -893,126 +899,153 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario, e
 
 // ── Genera imagen de recibo de pago (canvas) ──────────────────────────────
 // Devuelve un Buffer PNG listo para enviar con enviarImagen()
-function generarReciboImagen({ clienteNombre, clienteDireccion = "", monto, fecha, metodo = "Efectivo", mesPago = "", empresa = "", cajero = "Admin", referencia = "" }) {
-    const W   = 520, PAD = 32;
-    const fnt = (size, bold = false) => `${bold ? "bold " : ""}${size}px ${RECEIPT_FONT}`;
-    const fmtCOP   = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
-    const fmtFecha = (d) => { try { return new Date(d).toLocaleDateString("es-CO", { day: "2-digit", month: "long", year: "numeric" }); } catch { return d || ""; } };
-    const truncate = (s, max = 38) => String(s).length > max ? String(s).slice(0, max - 2) + ".." : String(s);
+function generarReciboImagen({ clienteNombre, clienteDireccion = "", monto, fecha, metodo = "Efectivo", mesPago = "", empresa = "", nit = "", telefono = "", cajero = "Admin", codigoInterno = "", referencia = "" }) {
+    const W = 420, PAD = 28;
+    const f  = (sz, bold = false) => `${bold ? "bold " : ""}${sz}px ${RF}`;
+    const fmt = (n) => "$ " + new Intl.NumberFormat("es-CO", { maximumFractionDigits: 0 }).format(n);
+    const fmtFecha = (d) => { try { const dt = new Date(d); return dt.toLocaleDateString("es-CO", { day: "numeric", month: "numeric", year: "numeric" }) + "\n" + dt.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: true }); } catch { return ""; } };
+    const trunc = (s, max) => { const str = String(s || ""); return str.length > max ? str.slice(0, max - 2) + ".." : str; };
+    const line  = (ctx, x1, y, x2) => { ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke(); };
 
-    const lineH = 24, headerH = 94, footerH = 52;
-    const rows = [
-        ["Cliente",    clienteNombre],
-        ["Direccion",  clienteDireccion || "-"],
-        ["Mes pagado", mesPago || "-"],
-        ["Metodo",     metodo],
-        ["Cajero",     cajero],
-        ...(referencia ? [["Referencia", referencia]] : []),
-    ];
-    const H = headerH + 20 + rows.length * (lineH + 10) + 20 + 64 + 20 + footerH;
-
+    // ── Calcular altura total ──────────────────────────────────────────────
+    const H = 60 + 80 + 24 + 80 + 2 + 60 + 2 + 50 + 2 + 80 + 50 + 40;
     const canvas = createCanvas(W, H);
     const ctx    = canvas.getContext("2d");
 
-    // Fondo
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, W, H);
-    ctx.strokeStyle = "#e2e8f0";
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(1, 1, W - 2, H - 2);
 
-    // Header verde
-    ctx.fillStyle = "#16a34a";
-    ctx.fillRect(0, 0, W, headerH);
+    let y = 20;
 
-    // Línea decorativa más oscura en la parte superior
-    ctx.fillStyle = "#15803d";
-    ctx.fillRect(0, 0, W, 4);
-
-    ctx.fillStyle = "#ffffff";
+    // ── Nombre empresa (grande, centrado, negrita) ─────────────────────────
+    ctx.fillStyle = "#000000";
     ctx.textAlign = "center";
-    ctx.font = fnt(22, true);
-    ctx.fillText(empresa || "ISP", W / 2, 38);
+    const nombreLineas = (empresa || "ISP").toUpperCase().split(" ");
+    // Máx 2 palabras por línea para imitar el PDF
+    ctx.font = f(20, true);
+    let linea = "";
+    for (const w of nombreLineas) {
+        const prueba = linea ? linea + " " + w : w;
+        if (ctx.measureText(prueba).width > W - PAD * 2 && linea) {
+            ctx.fillText(linea, W / 2, y); y += 26; linea = w;
+        } else { linea = prueba; }
+    }
+    if (linea) { ctx.fillText(linea, W / 2, y); y += 26; }
 
-    ctx.font = fnt(13);
-    ctx.fillText("Recibo de Pago", W / 2, 59);
+    // NIT y teléfono
+    if (nit || telefono) {
+        ctx.font = f(11);
+        ctx.fillText([nit, telefono].filter(Boolean).join("  -  "), W / 2, y); y += 18;
+    }
+    y += 10;
 
-    ctx.font = fnt(11);
-    ctx.fillStyle = "rgba(255,255,255,0.7)";
-    ctx.fillText(fmtFecha(fecha), W / 2, 76);
+    // ── Separador ─────────────────────────────────────────────────────────
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1.5;
+    line(ctx, PAD, y, W - PAD); y += 8;
 
-    // Badge PAGADO (sin roundRect — solo rect redondeado manual con arco)
-    const bx = W / 2 - 38, by = headerH - 16, bw = 76, bh = 22, br = 11;
-    ctx.fillStyle = "#dcfce7";
-    ctx.beginPath();
-    ctx.moveTo(bx + br, by);
-    ctx.lineTo(bx + bw - br, by);
-    ctx.arcTo(bx + bw, by, bx + bw, by + br, br);
-    ctx.lineTo(bx + bw, by + bh - br);
-    ctx.arcTo(bx + bw, by + bh, bx + bw - br, by + bh, br);
-    ctx.lineTo(bx + br, by + bh);
-    ctx.arcTo(bx, by + bh, bx, by + bh - br, br);
-    ctx.lineTo(bx, by + br);
-    ctx.arcTo(bx, by, bx + br, by, br);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = "#15803d";
-    ctx.font = fnt(11, true);
-    ctx.fillText("PAGADO", W / 2, headerH + 4);
+    // ── COMPROBANTE DE PAGO + numero ──────────────────────────────────────
+    ctx.font = f(13, true);
+    ctx.fillText("COMPROBANTE DE PAGO", W / 2, y + 14); y += 20;
 
-    // Tabla de datos
-    let y = headerH + 28;
+    // Número de recibo (últimos 8 chars del timestamp)
+    const numRecibo = String(Date.now()).slice(-8);
+    ctx.font = f(13, true);
+    ctx.fillText(numRecibo, W / 2, y + 14); y += 22;
+
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+    line(ctx, PAD, y, W - PAD); y += 10;
+
+    // ── DATOS DEL SUSCRIPTOR ──────────────────────────────────────────────
+    ctx.font = f(11, true);
     ctx.textAlign = "left";
-    rows.forEach(([label, value], i) => {
-        ctx.fillStyle = i % 2 === 0 ? "#f8fafc" : "#ffffff";
-        ctx.fillRect(PAD, y - 16, W - PAD * 2, lineH + 6);
+    ctx.fillText("DATOS DEL SUSCRIPTOR", PAD, y + 12); y += 4;
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+    line(ctx, PAD, y + 14, W - PAD); y += 20;
 
-        ctx.fillStyle = "#64748b";
-        ctx.font = fnt(11);
-        ctx.fillText(label, PAD + 10, y);
+    const datosRows = [
+        ["Nombre:",        trunc(clienteNombre, 30)],
+        ["Direccion:",     trunc(clienteDireccion || "-", 30)],
+        ...(codigoInterno ? [["Cod. Interno:", codigoInterno]] : []),
+    ];
+    ctx.font = f(11);
+    for (const [lbl, val] of datosRows) {
+        ctx.fillStyle = "#000";
+        ctx.font = f(11, true);
+        ctx.fillText(lbl, PAD, y + 12);
+        ctx.font = f(11);
+        ctx.fillText(val, PAD + 90, y + 12);
+        y += 18;
+    }
+    y += 6;
 
-        ctx.fillStyle = "#1e293b";
-        ctx.font = fnt(12, true);
-        ctx.fillText(truncate(value), PAD + 136, y);
-
-        y += lineH + 10;
-    });
-
-    // Separador
-    ctx.strokeStyle = "#e2e8f0";
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(PAD, y + 4); ctx.lineTo(W - PAD, y + 4); ctx.stroke();
-    y += 18;
-
-    // Caja total
-    ctx.fillStyle = "#f0fdf4";
-    ctx.fillRect(PAD, y, W - PAD * 2, 60);
-    ctx.strokeStyle = "#bbf7d0";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(PAD, y, W - PAD * 2, 60);
+    // ── FECHA / CAJERO (2 columnas) ───────────────────────────────────────
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+    ctx.strokeRect(PAD, y, W - PAD * 2, 52);
+    line(ctx, W / 2, y, W / 2, y + 52);
 
     ctx.textAlign = "center";
-    ctx.fillStyle = "#64748b";
-    ctx.font = fnt(11);
-    ctx.fillText("TOTAL PAGADO", W / 2, y + 18);
+    ctx.font = f(10, true);
+    ctx.fillText("FECHA DE PAGO", W / 4 + PAD / 2, y + 14);
+    ctx.fillText("CAJERO", W * 3 / 4 - PAD / 2 + 6, y + 14);
 
-    ctx.fillStyle = "#15803d";
-    ctx.font = fnt(26, true);
-    ctx.fillText(fmtCOP(monto), W / 2, y + 48);
-    y += 60 + 18;
+    ctx.font = f(11);
+    const [fechaLine1, fechaLine2] = fmtFecha(fecha).split("\n");
+    ctx.fillText(fechaLine1 || "", W / 4 + PAD / 2, y + 30);
+    ctx.fillText(fechaLine2 || "", W / 4 + PAD / 2, y + 44);
+    ctx.fillText(trunc(cajero, 18), W * 3 / 4 - PAD / 2 + 6, y + 36);
+    y += 60;
 
-    // Footer
-    ctx.fillStyle = "#f1f5f9";
-    ctx.fillRect(0, H - footerH, W, footerH);
-    ctx.strokeStyle = "#e2e8f0";
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, H - footerH); ctx.lineTo(W, H - footerH); ctx.stroke();
+    // ── Tabla Concepto / Valor ────────────────────────────────────────────
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1;
+    ctx.strokeRect(PAD, y, W - PAD * 2, 28);
+    line(ctx, W - PAD - 90, y, W - PAD - 90, y + 28);
 
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = fnt(10);
+    ctx.font = f(11, true);
+    ctx.textAlign = "left";
+    ctx.fillText("Concepto", PAD + 6, y + 18);
+    ctx.textAlign = "right";
+    ctx.fillText("Valor", W - PAD - 6, y + 18);
+    y += 28;
+
+    // Fila de datos
+    ctx.strokeStyle = "#000";
+    ctx.strokeRect(PAD, y, W - PAD * 2, 28);
+    line(ctx, W - PAD - 90, y, W - PAD - 90, y + 28);
+
+    const concepto = mesPago ? "Mensualidad " + mesPago : "Mensualidad";
+    ctx.font = f(11);
+    ctx.textAlign = "left";
+    ctx.fillText(concepto, PAD + 6, y + 18);
+    ctx.textAlign = "right";
+    ctx.fillText(fmt(monto), W - PAD - 6, y + 18);
+    y += 36;
+
+    // ── TOTAL PAGADO ──────────────────────────────────────────────────────
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1.5;
+    ctx.strokeRect(PAD, y, W - PAD * 2, 52);
+    line(ctx, W - PAD - 120, y, W - PAD - 120, y + 52);
+
+    ctx.font = f(13, true);
+    ctx.textAlign = "left";
+    ctx.fillText("TOTAL\nPAGADO", PAD + 8, y + 18);
+    ctx.fillText("PAGADO", PAD + 8, y + 36);
+
+    ctx.font = f(26, true);
+    ctx.textAlign = "right";
+    ctx.fillText(fmt(monto), W - PAD - 6, y + 38);
+    y += 60;
+
+    // ── Footer ────────────────────────────────────────────────────────────
+    ctx.font = f(10, true);
     ctx.textAlign = "center";
-    ctx.fillText("Documento generado automaticamente  -  " + (empresa || "ISP"), W / 2, H - footerH + 18);
-    ctx.fillText("Este recibo es valido como comprobante de pago", W / 2, H - footerH + 36);
+    ctx.fillStyle = "#000";
+    ctx.fillText("Pago verificado por el sistema", W / 2, y + 14); y += 22;
+
+    ctx.font = f(10);
+    ctx.fillText("- Fin del documento -", W / 2, y + 12); y += 18;
+
+    const ahora = new Date().toLocaleDateString("es-CO");
+    ctx.fillText("Impreso: " + ahora, W / 2, y + 12);
 
     return canvas.toBuffer("image/png");
 }
@@ -2169,6 +2202,8 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                 const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
                 const dt = up.ts ? new Date(up.ts) : new Date();
                 try {
+                    const empConf = await db.collection("settings").doc("empresa").get().catch(()=>null);
+                    const empData = empConf?.exists ? empConf.data() : {};
                     const imgBuf = generarReciboImagen({
                         clienteNombre:    c.nombre,
                         clienteDireccion: c.direccion || c.barrio || "",
@@ -2176,8 +2211,11 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                         fecha:            dt.toISOString(),
                         metodo:           up.metodo || "Efectivo",
                         mesPago:          `${MESES_N[dt.getMonth()]} ${dt.getFullYear()}`,
-                        empresa:          process.env.NOMBRE_EMPRESA || "ISP",
+                        empresa:          empData.nombreEmpresa || process.env.NOMBRE_EMPRESA || "ISP",
+                        nit:              empData.nit || "",
+                        telefono:         empData.telefono || "",
                         cajero:           nombre,
+                        codigoInterno:    c.id ? c.id.slice(0, 8).toUpperCase() : "",
                     });
                     // Subir a Storage para enviar por URL (más confiable que Buffer en Baileys)
                     const bucket   = admin.storage().bucket();
