@@ -1124,31 +1124,35 @@ Reglas:
 }
 
 // Aplica un pago manual al registro de deuda de un cliente en Firestore
-async function aplicarPagoManual(cliente, monto, registradoPor) {
+async function aplicarPagoManual(cliente, monto, registradoPor, opciones = {}) {
+    const { imageUrl = null, method = "efectivo" } = opciones;
     let remaining = monto;
     const pagos   = cliente.pagos ? JSON.parse(JSON.stringify(cliente.pagos)) : {};
-    const years   = Object.keys(pagos).sort((a, b) => a - b);
 
-    for (const year of years) {
-        const months = Object.keys(pagos[year]).sort((a, b) => a - b);
-        for (const month of months) {
-            if (remaining <= 0) break;
-            const m    = pagos[year][month];
-            const debt = m.debt || cliente.pago || 0;
-            const paid = (m.payments || [])
-                .filter(p => p.status !== "voided" && p.type !== "charge")
-                .reduce((s, p) => s + p.amount, 0);
-            const owed = Math.max(0, debt - paid);
-            if (owed > 0) {
-                const amount = Math.min(remaining, owed);
-                pagos[year][month].payments = [
-                    ...(m.payments || []),
-                    { amount, date: new Date().toISOString(), method: "efectivo", status: "active", type: "payment", source: `manual_staff:${registradoPor}` },
-                ];
-                remaining -= amount;
-            }
+    // Iterar meses desde el más antiguo al más reciente
+    const regDate  = cliente.fecha ? new Date(cliente.fecha) : new Date(2022, 0, 1);
+    const startAbs = (regDate.getFullYear() * 12 + regDate.getMonth()) + 1;
+    const hoy      = new Date();
+    const endAbs   = hoy.getFullYear() * 12 + hoy.getMonth();
+
+    for (let abs = startAbs; abs <= endAbs && remaining > 0; abs++) {
+        const y  = String(Math.floor(abs / 12));
+        const mo = String(abs % 12);
+        const m  = pagos[y]?.[mo] || {};
+        const debt = m.debt !== undefined ? m.debt : (cliente.pago || 0);
+        const paid = (m.payments || [])
+            .filter(p => p.status !== "voided" && p.type !== "charge")
+            .reduce((s, p) => s + p.amount, 0);
+        const owed = Math.max(0, debt - paid);
+        if (owed > 0) {
+            const amount = Math.min(remaining, owed);
+            if (!pagos[y]) pagos[y] = {};
+            if (!pagos[y][mo]) pagos[y][mo] = { debt: cliente.pago || 0, payments: [] };
+            const entry = { amount, date: new Date().toISOString(), method, status: "active", type: "payment", source: `manual_staff:${registradoPor}` };
+            if (imageUrl) entry.imageUrl = imageUrl;
+            pagos[y][mo].payments = [...(pagos[y]?.[mo]?.payments || []), entry];
+            remaining -= amount;
         }
-        if (remaining <= 0) break;
     }
 
     // Saldo a favor si sobra
@@ -1158,14 +1162,13 @@ async function aplicarPagoManual(cliente, monto, registradoPor) {
         const mo = String(now.getMonth());
         if (!pagos[y]) pagos[y] = {};
         if (!pagos[y][mo]) pagos[y][mo] = { debt: cliente.pago || 0, payments: [] };
-        pagos[y][mo].payments = [
-            ...(pagos[y][mo].payments || []),
-            { amount: remaining, date: new Date().toISOString(), method: "efectivo", status: "active", type: "payment", source: `manual_staff_favor:${registradoPor}` },
-        ];
+        const entry = { amount: remaining, date: new Date().toISOString(), method, status: "active", type: "payment", source: `manual_staff_favor:${registradoPor}` };
+        if (imageUrl) entry.imageUrl = imageUrl;
+        pagos[y][mo].payments = [...(pagos[y][mo].payments || []), entry];
     }
 
     await db.collection("clients").doc(cliente.id).set({ pagos }, { merge: true });
-    return remaining; // cuánto quedó como saldo a favor (0 si cubrió exacto o parcial)
+    return remaining;
 }
 
 // Flujo multi-paso: registrar pago manual
@@ -1253,7 +1256,10 @@ async function aprobarPagoPreaprobado(pagoId, pagoData, aprobadoPor) {
     if (!clientSnap.exists) throw new Error("Cliente no encontrado");
     const cliente = { id: clientSnap.id, ...clientSnap.data() };
     const monto   = pagoData.extractedAmount || 0;
-    const favor   = await aplicarPagoManual(cliente, monto, `aprobado_bot:${aprobadoPor}`);
+    const favor   = await aplicarPagoManual(cliente, monto, `aprobado_bot:${aprobadoPor}`, {
+        imageUrl: pagoData.imageUrl || null,
+        method:   "transferencia",
+    });
     await db.collection("pagos_preaprobados").doc(pagoId).set({
         status: "approved", approvedBy: aprobadoPor,
         approvedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2022,12 +2028,17 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                     }
                 }
 
-                // 2. Complementar con pagos_preaprobados (pendientes de aprobación)
+                // 2. Complementar con pagos_preaprobados — buscar por clientId si tenemos cliente
+                //    o por senderName fuzzy si no
                 if (enviados.length < 3) {
                     const snapPre = await db.collection("pagos_preaprobados")
-                        .orderBy("date", "desc").limit(50).get();
-                    const matchesPre = snapPre.docs.map(d=>({id:d.id,...d.data()}))
-                        .filter(p => fuzzyNombre(p.senderName||"", termComp));
+                        .orderBy("date", "desc").limit(100).get();
+                    const allPre = snapPre.docs.map(d=>({id:d.id,...d.data()}));
+                    const matchesPre = c
+                        ? allPre.filter(p => p.clientId === c.id || fuzzyNombre(p.senderName||"", termComp))
+                        : allPre.filter(p => fuzzyNombre(p.senderName||"", termComp));
+                    // Ordenar: más recientes primero
+                    matchesPre.sort((a, b) => (b.date||"").localeCompare(a.date||""));
                     for (const p of matchesPre.slice(0, 3 - enviados.length)) {
                         if (p.imageUrl) {
                             const statusLbl = p.status==="pending"?"⏳ Pendiente":p.status==="approved"?"✅ Aprobado":"❌ Rechazado";
