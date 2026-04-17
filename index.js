@@ -2168,18 +2168,31 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                 if (!up.monto) { datosContexto = `${c.nombre} no tiene pagos registrados para generar un recibo.`; break; }
                 const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
                 const dt = up.ts ? new Date(up.ts) : new Date();
-                const imgBuf = generarReciboImagen({
-                    clienteNombre:    c.nombre,
-                    clienteDireccion: c.direccion || c.barrio || "",
-                    monto:            up.monto,
-                    fecha:            dt.toISOString(),
-                    metodo:           up.metodo || "Efectivo",
-                    mesPago:          `${MESES_N[dt.getMonth()]} ${dt.getFullYear()}`,
-                    empresa:          process.env.NOMBRE_EMPRESA || "ISP",
-                    cajero:           nombre,
-                });
-                await enviarImagen(phone, imgBuf, `Recibo de pago — ${c.nombre} | ${fmt(up.monto)}`);
-                datosContexto = `Recibo generado y enviado para ${c.nombre} — ultimo pago: ${fmt(up.monto)} el ${up.fecha||"sin fecha"}.`;
+                try {
+                    const imgBuf = generarReciboImagen({
+                        clienteNombre:    c.nombre,
+                        clienteDireccion: c.direccion || c.barrio || "",
+                        monto:            up.monto,
+                        fecha:            dt.toISOString(),
+                        metodo:           up.metodo || "Efectivo",
+                        mesPago:          `${MESES_N[dt.getMonth()]} ${dt.getFullYear()}`,
+                        empresa:          process.env.NOMBRE_EMPRESA || "ISP",
+                        cajero:           nombre,
+                    });
+                    // Subir a Storage para enviar por URL (más confiable que Buffer en Baileys)
+                    const bucket   = admin.storage().bucket();
+                    const fileName = `receipts/recibo_${c.id}_${Date.now()}.png`;
+                    const file     = bucket.file(fileName);
+                    await file.save(imgBuf, { metadata: { contentType: "image/png" } });
+                    await file.makePublic();
+                    const reciboUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+                    const cap = `Recibo de pago | ${c.nombre} | ${fmt(up.monto)} | ${up.fecha || ""}`;
+                    await enviarImagen(phone, reciboUrl, cap);
+                    datosContexto = `Recibo generado y enviado para ${c.nombre} — ultimo pago: ${fmt(up.monto)} el ${up.fecha||"sin fecha"}.`;
+                } catch (e) {
+                    console.error("[RECIBO] Error generando recibo:", e.message);
+                    datosContexto = `Error generando el recibo de ${c.nombre}: ${e.message}`;
+                }
                 break;
             }
 
