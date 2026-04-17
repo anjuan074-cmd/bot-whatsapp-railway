@@ -1229,7 +1229,7 @@ Reglas:
 
 // Aplica un pago manual al registro de deuda de un cliente en Firestore
 async function aplicarPagoManual(cliente, monto, registradoPor, opciones = {}) {
-    const { imageUrl = null, method = "efectivo" } = opciones;
+    const { method = "efectivo" } = opciones; // imageUrl no se guarda en payments[] (evita acumulación de espacio)
     let remaining = monto;
     const pagos   = cliente.pagos ? JSON.parse(JSON.stringify(cliente.pagos)) : {};
 
@@ -1253,7 +1253,6 @@ async function aplicarPagoManual(cliente, monto, registradoPor, opciones = {}) {
             if (!pagos[y]) pagos[y] = {};
             if (!pagos[y][mo]) pagos[y][mo] = { debt: cliente.pago || 0, payments: [] };
             const entry = { amount, date: new Date().toISOString(), method, status: "active", type: "payment", source: `manual_staff:${registradoPor}` };
-            if (imageUrl) entry.imageUrl = imageUrl;
             pagos[y][mo].payments = [...(pagos[y]?.[mo]?.payments || []), entry];
             remaining -= amount;
         }
@@ -1267,7 +1266,6 @@ async function aplicarPagoManual(cliente, monto, registradoPor, opciones = {}) {
         if (!pagos[y]) pagos[y] = {};
         if (!pagos[y][mo]) pagos[y][mo] = { debt: cliente.pago || 0, payments: [] };
         const entry = { amount: remaining, date: new Date().toISOString(), method, status: "active", type: "payment", source: `manual_staff_favor:${registradoPor}` };
-        if (imageUrl) entry.imageUrl = imageUrl;
         pagos[y][mo].payments = [...(pagos[y][mo].payments || []), entry];
     }
 
@@ -1827,7 +1825,7 @@ ACCIONES:
 - ver_zona: clientes de una zona o barrio específico
 - ver_tickets: tickets de soporte abiertos
 - pagos_pendientes: listar comprobantes por revisar/aprobar
-- ver_comprobante: ver la imagen/foto del comprobante de pago de un cliente
+- ver_comprobante: ver, obtener o generar el comprobante/recibo de pago de un cliente (foto guardada o recibo generado). Usar también cuando el usuario dice "generalo", "genera el recibo", "mándame el recibo", "muéstrame el comprobante".
 - aprobar_pago: aprobar un comprobante pendiente y aplicarlo a la cuenta
 - rechazar_pago: rechazar un comprobante pendiente
 - eliminar_pago_pendiente: eliminar/borrar un comprobante pendiente de la lista (sin aplicar)
@@ -2102,86 +2100,58 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                 break;
             }
 
-            // ─── Ver imagen del comprobante ───────────────────────────────────
-            case "ver_comprobante": {
-                const termComp = buscar;
+            // ─── Ver / generar comprobante de pago ───────────────────────────
+            case "ver_comprobante":
+            case "generar_recibo": {
+                const termComp = buscar || pagoInfo;
                 if (!termComp) { datosContexto = "No se especificó de qué cliente ver el comprobante."; break; }
-                const MESES_C = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
                 const enviados = [];
-
-                // 1. Buscar en los pagos YA aprobados del cliente (dentro de pagos[año][mes].payments)
                 const c = await buscarClienteEnDB(termComp);
-                if (c && c.pagos) {
-                    const pagosConImg = [];
-                    for (const yr of Object.keys(c.pagos)) {
-                        for (const mo of Object.keys(c.pagos[yr])) {
-                            for (const p of (c.pagos[yr][mo].payments || [])) {
-                                const imgUrl = p.imageUrl || p.receiptUrl;
-                                if (imgUrl && p.type !== "charge" && p.status !== "voided") {
-                                    pagosConImg.push({ ...p, yr, mo, dateObj: p.date ? new Date(p.date) : new Date(0) });
-                                }
-                            }
-                        }
-                    }
-                    pagosConImg.sort((a, b) => b.dateObj - a.dateObj);
-                    for (const p of pagosConImg.slice(0, 3)) {
-                        const imgUrl = p.imageUrl || p.receiptUrl;
-                        const cap = `📋 ${c.nombre} — ${fmt(p.amount||0)}\n${p.method||""} | ${MESES_C[parseInt(p.mo)]} ${p.yr}`;
-                        await enviarImagen(phone, imgUrl, cap);
-                        enviados.push(`${MESES_C[parseInt(p.mo)]} ${p.yr}`);
+
+                // 1. Foto real en pagos_preaprobados (guardada cuando el cliente envió el comprobante)
+                const snapPre = await db.collection("pagos_preaprobados")
+                    .orderBy("date", "desc").limit(100).get();
+                const allPre  = snapPre.docs.map(d=>({id:d.id,...d.data()}));
+                const matches = c
+                    ? allPre.filter(p => p.clientId === c.id || fuzzyNombre(p.senderName||"", termComp))
+                    : allPre.filter(p => fuzzyNombre(p.senderName||"", termComp));
+                matches.sort((a,b) => (b.date||"").localeCompare(a.date||""));
+                for (const p of matches.slice(0,3)) {
+                    if (p.imageUrl) {
+                        const lbl = p.status==="pending"?"⏳ Pendiente":p.status==="approved"?"✅ Aprobado":"❌ Rechazado";
+                        const cap = `📋 ${p.senderName||"?"} — ${fmt(p.extractedAmount||0)}\n${p.bancoOrigen||""} | ${lbl}\n${p.date?new Date(p.date).toLocaleDateString("es-CO"):""}`;
+                        await enviarImagen(phone, p.imageUrl, cap);
+                        enviados.push(p.senderName||"?");
                     }
                 }
 
-                // 2. Complementar con pagos_preaprobados — buscar por clientId si tenemos cliente
-                //    o por senderName fuzzy si no
-                if (enviados.length < 3) {
-                    const snapPre = await db.collection("pagos_preaprobados")
-                        .orderBy("date", "desc").limit(100).get();
-                    const allPre = snapPre.docs.map(d=>({id:d.id,...d.data()}));
-                    const matchesPre = c
-                        ? allPre.filter(p => p.clientId === c.id || fuzzyNombre(p.senderName||"", termComp))
-                        : allPre.filter(p => fuzzyNombre(p.senderName||"", termComp));
-                    // Ordenar: más recientes primero
-                    matchesPre.sort((a, b) => (b.date||"").localeCompare(a.date||""));
-                    for (const p of matchesPre.slice(0, 3 - enviados.length)) {
-                        if (p.imageUrl) {
-                            const statusLbl = p.status==="pending"?"⏳ Pendiente":p.status==="approved"?"✅ Aprobado":"❌ Rechazado";
-                            const cap = `📋 ${p.senderName||"?"} — ${fmt(p.extractedAmount||0)}\n${p.bancoOrigen||""} | ${statusLbl}\n${p.date?new Date(p.date).toLocaleDateString("es-CO"):""}`;
-                            await enviarImagen(phone, p.imageUrl, cap);
-                            enviados.push(p.senderName||"?");
-                        }
-                    }
-                }
-
-                // 3. Si no hay ninguna imagen guardada pero encontramos el cliente,
-                //    generar recibo del último pago con canvas
+                // 2. Si no hay foto almacenada → generar recibo con canvas a partir del historial de pagos
                 if (enviados.length === 0 && c) {
                     const up = ultimoPago(c);
                     if (up.monto > 0) {
-                        // Determinar mes del último pago
                         const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
-                        const mesPagoStr = up.fecha
-                            ? `${MESES_N[up.ts ? new Date(up.ts).getMonth() : 0]} ${up.ts ? new Date(up.ts).getFullYear() : ""}`
-                            : "";
-                        const empresa = process.env.NOMBRE_EMPRESA || "ISP";
-                        const imgBuf  = generarReciboImagen({
+                        const dt = up.ts ? new Date(up.ts) : new Date();
+                        const imgBuf = generarReciboImagen({
                             clienteNombre:    c.nombre,
                             clienteDireccion: c.direccion || c.barrio || "",
                             monto:            up.monto,
-                            fecha:            up.ts ? new Date(up.ts).toISOString() : new Date().toISOString(),
+                            fecha:            dt.toISOString(),
                             metodo:           up.metodo || "Efectivo",
-                            mesPago:          mesPagoStr,
-                            empresa,
+                            mesPago:          `${MESES_N[dt.getMonth()]} ${dt.getFullYear()}`,
+                            empresa:          process.env.NOMBRE_EMPRESA || "ISP",
                         });
-                        const cap = `📋 Recibo generado — ${c.nombre}\n💵 ${new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(up.monto)}\n📅 ${up.fecha || ""}`;
+                        const cap = `📋 Recibo generado — ${c.nombre}\n💵 ${fmt(up.monto)}\n📅 ${up.fecha || ""}`;
                         await enviarImagen(phone, imgBuf, cap);
                         enviados.push(c.nombre);
+                    } else {
+                        datosContexto = `${c.nombre} no tiene pagos registrados para generar un recibo.`;
+                        break;
                     }
                 }
 
                 datosContexto = enviados.length
-                    ? `Se enviaron ${enviados.length} comprobante(s) de ${termComp}: ${enviados.join(", ")}.`
-                    : `No se encontraron comprobantes con imagen de "${termComp}".`;
+                    ? `Se envió el comprobante/recibo de ${termComp}.`
+                    : `No se encontraron comprobantes ni pagos registrados de "${termComp}".`;
                 break;
             }
 
