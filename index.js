@@ -28,6 +28,7 @@ const axios     = require("axios");
 const crypto    = require("crypto");
 const QRCode    = require("qrcode");
 const admin     = require("firebase-admin");
+const { createCanvas } = require("canvas");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const {
@@ -881,6 +882,109 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario, e
         chatRef.set(updateData, { merge: true }),
         chatRef.collection("messages").add(msgPayload),
     ]);
+}
+
+// ── Genera imagen de recibo de pago (canvas) ──────────────────────────────
+// Devuelve un Buffer PNG listo para enviar con enviarImagen()
+function generarReciboImagen({ clienteNombre, clienteDireccion = "", monto, fecha, metodo = "Efectivo", mesPago = "", empresa = "", cajero = "Admin", referencia = "" }) {
+    const W = 520, PAD = 32;
+    const fmtCOP = (n) => new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(n);
+    const fmtFecha = (d) => { try { return new Date(d).toLocaleDateString("es-CO", { day: "2-digit", month: "long", year: "numeric" }); } catch { return d || ""; } };
+
+    // ── Medir altura dinámica ──
+    const lineH = 22, section = 36, headerH = 90, footerH = 56;
+    const rows = [
+        ["Cliente",    clienteNombre],
+        ["Dirección",  clienteDireccion || "—"],
+        ["Mes pagado", mesPago || "—"],
+        ["Método",     metodo],
+        ["Cajero",     cajero],
+        ...(referencia ? [["Referencia", referencia]] : []),
+    ];
+    const H = headerH + section + rows.length * (lineH + 10) + section + 60 + footerH + PAD;
+
+    const canvas = createCanvas(W, H);
+    const ctx    = canvas.getContext("2d");
+
+    // Fondo blanco
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, W, H);
+
+    // Borde redondeado (simulado con rect + clip)
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(1, 1, W - 2, H - 2);
+
+    // Header verde
+    ctx.fillStyle = "#16a34a";
+    ctx.fillRect(0, 0, W, headerH);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font      = "bold 22px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(empresa || "ISP", W / 2, 38);
+    ctx.font      = "14px sans-serif";
+    ctx.fillText("Recibo de Pago", W / 2, 60);
+    ctx.font      = "11px sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.fillText(fmtFecha(fecha), W / 2, 78);
+
+    // Badge PAGADO
+    ctx.fillStyle  = "#dcfce7";
+    ctx.beginPath();
+    ctx.roundRect(W / 2 - 40, headerH - 14, 80, 24, 12);
+    ctx.fill();
+    ctx.fillStyle  = "#15803d";
+    ctx.font       = "bold 11px sans-serif";
+    ctx.fillText("✓ PAGADO", W / 2, headerH + 5);
+
+    // Tabla de datos
+    let y = headerH + section + 10;
+    ctx.textAlign = "left";
+    rows.forEach(([label, value], i) => {
+        const rowBg = i % 2 === 0 ? "#f8fafc" : "#ffffff";
+        ctx.fillStyle = rowBg;
+        ctx.fillRect(PAD, y - lineH + 4, W - PAD * 2, lineH + 8);
+
+        ctx.fillStyle = "#64748b";
+        ctx.font      = "11px sans-serif";
+        ctx.fillText(label, PAD + 8, y);
+
+        ctx.fillStyle = "#1e293b";
+        ctx.font      = "bold 12px sans-serif";
+        const val = String(value).length > 38 ? String(value).slice(0, 36) + "…" : String(value);
+        ctx.fillText(val, PAD + 130, y);
+        y += lineH + 10;
+    });
+
+    // Divider
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth   = 1;
+    ctx.beginPath(); ctx.moveTo(PAD, y + 8); ctx.lineTo(W - PAD, y + 8); ctx.stroke();
+    y += 20;
+
+    // Total
+    ctx.fillStyle = "#f0fdf4";
+    ctx.fillRect(PAD, y, W - PAD * 2, 52);
+    ctx.fillStyle = "#64748b";
+    ctx.font      = "12px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("TOTAL PAGADO", W / 2, y + 18);
+    ctx.fillStyle = "#15803d";
+    ctx.font      = "bold 26px sans-serif";
+    ctx.fillText(fmtCOP(monto), W / 2, y + 44);
+    y += 52 + 16;
+
+    // Footer
+    ctx.fillStyle = "#f1f5f9";
+    ctx.fillRect(0, H - footerH, W, footerH);
+    ctx.fillStyle = "#94a3b8";
+    ctx.font      = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Documento generado automáticamente — " + (empresa || "ISP"), W / 2, H - footerH + 20);
+    ctx.fillText("Este recibo es válido como comprobante de pago", W / 2, H - footerH + 36);
+
+    return canvas.toBuffer("image/png");
 }
 
 function calcularDeudaCliente(cliente) {
@@ -2049,6 +2153,32 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                     }
                 }
 
+                // 3. Si no hay ninguna imagen guardada pero encontramos el cliente,
+                //    generar recibo del último pago con canvas
+                if (enviados.length === 0 && c) {
+                    const up = ultimoPago(c);
+                    if (up.monto > 0) {
+                        // Determinar mes del último pago
+                        const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+                        const mesPagoStr = up.fecha
+                            ? `${MESES_N[up.ts ? new Date(up.ts).getMonth() : 0]} ${up.ts ? new Date(up.ts).getFullYear() : ""}`
+                            : "";
+                        const empresa = process.env.NOMBRE_EMPRESA || "ISP";
+                        const imgBuf  = generarReciboImagen({
+                            clienteNombre:    c.nombre,
+                            clienteDireccion: c.direccion || c.barrio || "",
+                            monto:            up.monto,
+                            fecha:            up.ts ? new Date(up.ts).toISOString() : new Date().toISOString(),
+                            metodo:           up.metodo || "Efectivo",
+                            mesPago:          mesPagoStr,
+                            empresa,
+                        });
+                        const cap = `📋 Recibo generado — ${c.nombre}\n💵 ${new Intl.NumberFormat("es-CO",{style:"currency",currency:"COP",maximumFractionDigits:0}).format(up.monto)}\n📅 ${up.fecha || ""}`;
+                        await enviarImagen(phone, imgBuf, cap);
+                        enviados.push(c.nombre);
+                    }
+                }
+
                 datosContexto = enviados.length
                     ? `Se enviaron ${enviados.length} comprobante(s) de ${termComp}: ${enviados.join(", ")}.`
                     : `No se encontraron comprobantes con imagen de "${termComp}".`;
@@ -2778,7 +2908,9 @@ async function enviarImagen(phone, imageSource, caption = "") {
     try {
         const payload = typeof imageSource === "string"
             ? { image: { url: imageSource }, caption }
-            : { image: imageSource,          caption };
+            : Buffer.isBuffer(imageSource)
+                ? { image: imageSource, caption }
+                : { image: imageSource, caption };
         const sent = await sock.sendMessage(jid, payload);
         return sent?.key?.id || null;
     } catch (err) {

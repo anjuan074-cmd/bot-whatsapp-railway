@@ -12,6 +12,7 @@
     "@google/generative-ai": "^0.24.1",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.13.4",
+    "canvas": "^3.2.3",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
     "firebase-admin": "^13.6.0",
