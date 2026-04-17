@@ -2281,7 +2281,7 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                 const MESES_N = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
                 const dt = up.ts ? new Date(up.ts) : new Date();
                 try {
-                    const empConf = await db.collection("settings").doc("empresa").get().catch(()=>null);
+                    const empConf = await db.collection("settings").doc("main").get().catch(()=>null);
                     const empData = empConf?.exists ? empConf.data() : {};
                     const logoUrl = empData.logo || empData.qrPortal?.logo || "";
                     const cuentasDigitales = Array.isArray(empData.cuentasDigitales) ? empData.cuentasDigitales
