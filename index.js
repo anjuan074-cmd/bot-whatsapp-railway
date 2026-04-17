@@ -2218,21 +2218,15 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                         cajero:           nombre,
                         codigoInterno:    c.id ? c.id.slice(0, 8).toUpperCase() : "",
                     });
-                    // Subir a Storage para enviar por URL (más confiable que Buffer en Baileys)
-                    const bucket   = admin.storage().bucket();
-                    const fileName = `receipts/recibo_${c.id}_${Date.now()}.png`;
-                    const file     = bucket.file(fileName);
-                    await file.save(imgBuf, { metadata: { contentType: "image/png" } });
-                    await file.makePublic();
-                    const reciboUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
                     const cap = `Recibo de pago | ${c.nombre} | ${fmt(up.monto)} | ${up.fecha || ""}`;
-                    await enviarImagen(phone, reciboUrl, cap);
-                    return; // imagen ya enviada, no pasar por generarRespuestaNatural
+                    const jid = toJID(phone);
+                    await sock.sendMessage(jid, { image: imgBuf, mimetype: "image/png", caption: cap });
+                    return; // imagen enviada, no pasar por generarRespuestaNatural
                 } catch (e) {
                     console.error("[RECIBO] Error generando recibo:", e.message);
-                    datosContexto = `Error generando el recibo de ${c.nombre}: ${e.message}`;
+                    await botResponder(phone, `No pude generar el recibo de ${c.nombre}: ${e.message}`);
+                    return;
                 }
-                break;
             }
 
             // ─── Aprobar / rechazar comprobante pendiente ─────────────────────
