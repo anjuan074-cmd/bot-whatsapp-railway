@@ -884,24 +884,32 @@ async function guardarMensajeChat(telefono, message, direction, nombreUsuario, e
 }
 
 function calcularDeudaCliente(cliente) {
+    const MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+    const hoy   = new Date();
+    // Igual que getClientDetailedStatus de la app React:
+    // iterar desde la fecha de registro hasta el mes actual inclusive
+    const regDate    = cliente.fecha ? new Date(cliente.fecha) : new Date(2022, 0, 1);
+    const startAbs   = (regDate.getFullYear() * 12 + regDate.getMonth()) + 1;
+    const targetAbs  = hoy.getFullYear() * 12 + hoy.getMonth(); // mes actual inclusive
+
     let totalDebt = 0;
     const months  = [];
-    const MESES   = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
-    const hoy     = new Date().getFullYear();
-    if (cliente.pagos) {
-        for (const year in cliente.pagos) {
-            for (const month in cliente.pagos[year]) {
-                const data = cliente.pagos[year][month];
-                const debt = data.debt || cliente.pago || 0;
-                const paid = (data.payments || []).reduce((a, p) => p.type !== "charge" ? a + p.amount : a, 0);
-                if (paid < debt) {
-                    totalDebt += (debt - paid);
-                    if (parseInt(year) >= hoy - 1) months.push(`${MESES[month]} ${year}`);
-                }
-            }
+
+    for (let abs = startAbs; abs <= targetAbs; abs++) {
+        const y = Math.floor(abs / 12);
+        const m = abs % 12;
+        const data = cliente.pagos?.[y]?.[m] || {};
+        const debt = data.debt !== undefined ? data.debt : (cliente.pago || 0);
+        const paid = (data.payments || [])
+            .filter(p => p.status !== "voided" && p.type !== "charge")
+            .reduce((s, p) => s + p.amount, 0);
+        if (paid < debt) {
+            totalDebt += (debt - paid);
+            months.push(`${MESES[m]} ${y}`);
         }
     }
-    return { totalDebt, monthsStr: months.slice(0, 3).join(", ") + (months.length > 3 ? "..." : "") };
+
+    return { totalDebt, monthsStr: months.slice(0, 4).join(", ") + (months.length > 4 ? "..." : "") };
 }
 
 async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
