@@ -2185,9 +2185,10 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                         enviados.push(p.senderName||"?");
                     }
                 }
-                datosContexto = enviados.length
-                    ? `Se enviaron ${enviados.length} comprobante(s) de pago de ${termComp}.`
-                    : `No se encontraron fotos de comprobante de "${termComp}". Si quieres el recibo oficial usa "generar recibo".`;
+                if (enviados.length) {
+                    return; // imagen ya enviada, no pasar por generarRespuestaNatural
+                }
+                datosContexto = `No se encontraron fotos de comprobante de "${termComp}". Si quieres el recibo oficial usa "generar recibo".`;
                 break;
             }
 
@@ -2226,7 +2227,7 @@ Responde SOLO JSON válido: {"accion":"...","buscar":"...","ordenar":"...","zona
                     const reciboUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
                     const cap = `Recibo de pago | ${c.nombre} | ${fmt(up.monto)} | ${up.fecha || ""}`;
                     await enviarImagen(phone, reciboUrl, cap);
-                    datosContexto = `Recibo generado y enviado para ${c.nombre} — ultimo pago: ${fmt(up.monto)} el ${up.fecha||"sin fecha"}.`;
+                    return; // imagen ya enviada, no pasar por generarRespuestaNatural
                 } catch (e) {
                     console.error("[RECIBO] Error generando recibo:", e.message);
                     datosContexto = `Error generando el recibo de ${c.nombre}: ${e.message}`;
