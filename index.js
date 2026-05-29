@@ -300,17 +300,18 @@ async function iniciarWhatsApp() {
         }
     });
 
-    // messages.update: Baileys dispara este evento para chats 1:1 (entregado → leído).
+    // messages.update: Baileys 1:1 chats — entregado → leído.
     // proto.WebMessageInfo.Status: SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5
+    // NO filtramos por fromMe aquí porque en 7.x RC el campo puede ser false
+    // para receipts de nuestros propios mensajes; applyAck filtra via wamid_index.
     sock.ev.on("messages.update", async (updates) => {
         for (const update of updates) {
-            if (!update.key?.fromMe) continue;
             const status = update.update?.status;
-            if (!status || status < 2) continue;
-            // Mapeo: DELIVERY_ACK(3)→ack=2  READ(4)→ack=3  SERVER_ACK(2)→ack=1
+            const waMessageId = update.key?.id;
+            if (!waMessageId || !status || status < 2) continue;
+            // Mapeo: SERVER_ACK(2)→ack=1  DELIVERY_ACK(3)→ack=2  READ(4+)→ack=3
             const ack = status >= 4 ? 3 : status >= 3 ? 2 : 1;
-            const waMessageId = update.key.id;
-            console.log(`[MSG-UPDATE] waMessageId=${waMessageId} status=${status} ack=${ack}`);
+            console.log(`[MSG-UPDATE] id=${waMessageId} fromMe=${update.key?.fromMe} status=${status} ack=${ack}`);
             await applyAck(waMessageId, ack);
         }
     });
