@@ -271,52 +271,47 @@ async function iniciarWhatsApp() {
         }
     });
 
+    // Función auxiliar: actualiza ack usando el índice wamid_index (O(1), sin race condition)
+    async function applyAck(waMessageId, ack) {
+        try {
+            const idxDoc = await db.collection("wamid_index").doc(waMessageId).get();
+            if (!idxDoc.exists) {
+                console.warn(`[ACK] wamid ${waMessageId} no está en índice — ignorado`);
+                return;
+            }
+            const { chatId, msgId } = idxDoc.data();
+            await Promise.all([
+                db.collection("chats").doc(chatId).collection("messages").doc(msgId).update({ ack }),
+                db.collection("chats").doc(chatId).update({ lastMessageAck: ack }),
+            ]);
+            console.log(`[ACK] ✓ chatId=${chatId} msgId=${msgId} ack=${ack}`);
+        } catch (err) {
+            console.error("[ACK] Error aplicando ack:", err.message);
+        }
+    }
+
     sock.ev.on("message-receipt.update", async (updates) => {
         for (const update of updates) {
-            const remoteJid = update.key.remoteJid || "";
-            let raw = remoteJid.split("@")[0].split(":")[0];
-            // Resolver @lid igual que en procesarMensajeEntrante
-            if (remoteJid.endsWith("@lid")) {
-                const alt = update.key.remoteJidAlt;
-                if (!alt) continue;
-                raw = alt.split("@")[0].split(":")[0];
-            }
-            const jid = normalizePhone(raw);
-            const ack = update.receipt.readTimestamp ? 3 : update.receipt.receiptTimestamp ? 2 : 1;
-            if (!jid) continue;
-            console.log(`[ACK] ${jid} msgId=${update.key.id} ack=${ack}`);
-            try {
-                const snap = await db.collection("chats").doc(jid)
-                    .collection("messages").where("waMessageId", "==", update.key.id).limit(1).get();
-                if (!snap.empty) await snap.docs[0].ref.update({ ack });
-            } catch { /* no crítico */ }
+            const waMessageId = update.key?.id;
+            if (!waMessageId) continue;
+            const ack = update.receipt?.readTimestamp ? 3 : update.receipt?.receiptTimestamp ? 2 : 1;
+            console.log(`[RECEIPT] waMessageId=${waMessageId} ack=${ack}`);
+            await applyAck(waMessageId, ack);
         }
     });
 
-    // messages.update: Baileys dispara este evento cuando cambia el estado (ack)
-    // de los mensajes ENVIADOS por nosotros (enviados → entregado → leído).
+    // messages.update: Baileys dispara este evento para chats 1:1 (entregado → leído).
+    // proto.WebMessageInfo.Status: SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5
     sock.ev.on("messages.update", async (updates) => {
         for (const update of updates) {
-            if (!update.key.fromMe) continue; // solo nuestros mensajes salientes
+            if (!update.key?.fromMe) continue;
             const status = update.update?.status;
-            if (!status) continue;
-            // proto.WebMessageInfo.Status: SERVER_ACK=1, DELIVERY_ACK=2, READ=3, PLAYED=4
-            const ack = status >= 3 ? 3 : status >= 2 ? 2 : 1;
-            const remoteJid = update.key.remoteJid || "";
-            let raw = remoteJid.split("@")[0].split(":")[0];
-            if (remoteJid.endsWith("@lid")) {
-                const alt = update.key.remoteJidAlt;
-                if (!alt) continue;
-                raw = alt.split("@")[0].split(":")[0];
-            }
-            const jid = normalizePhone(raw);
-            if (!jid) continue;
-            console.log(`[MSG-UPDATE] ${jid} msgId=${update.key.id} status=${status} ack=${ack}`);
-            try {
-                const snap = await db.collection("chats").doc(jid)
-                    .collection("messages").where("waMessageId", "==", update.key.id).limit(1).get();
-                if (!snap.empty) await snap.docs[0].ref.update({ ack });
-            } catch { /* no crítico */ }
+            if (!status || status < 2) continue;
+            // Mapeo: DELIVERY_ACK(3)→ack=2  READ(4)→ack=3  SERVER_ACK(2)→ack=1
+            const ack = status >= 4 ? 3 : status >= 3 ? 2 : 1;
+            const waMessageId = update.key.id;
+            console.log(`[MSG-UPDATE] waMessageId=${waMessageId} status=${status} ack=${ack}`);
+            await applyAck(waMessageId, ack);
         }
     });
 }
@@ -3151,12 +3146,15 @@ app.post("/enviarMensajeManual", auth, async (req, res) => {
     const { telefono, mensaje, firestoreMsgId } = req.body;
     if (!telefono || !mensaje) return res.status(400).json({ error: "Faltan datos" });
     const msgId = await enviarTexto(telefono, mensaje);
-    // Si el frontend pasó el ID del doc que guardó, lo vinculamos con el waMessageId
-    // para que los ACK receipts (doble chulo / chulo azul) funcionen.
     if (msgId && firestoreMsgId) {
-        const jid = normalizePhone(telefono);
-        db.collection("chats").doc(jid).collection("messages").doc(firestoreMsgId)
-            .update({ waMessageId: msgId }).catch(() => {});
+        const chatId = normalizePhone(telefono);
+        // Índice O(1): waMessageId → {chatId, msgId} — igual que el canal Meta API.
+        // Se escribe ANTES de que lleguen los ACK receipts de WA para evitar race condition.
+        await Promise.all([
+            db.collection("wamid_index").doc(msgId).set({ chatId, msgId: firestoreMsgId }),
+            db.collection("chats").doc(chatId).collection("messages").doc(firestoreMsgId)
+                .update({ waMessageId: msgId, ack: 1 }).catch(() => {}),
+        ]);
     }
     res.json({ success: !!msgId, msgId });
 });
