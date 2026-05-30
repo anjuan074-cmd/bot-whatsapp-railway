@@ -698,22 +698,25 @@ Responde SOLO con JSON válido sin texto adicional:
 
         case "asesor": {
             const clientPhoneN = normalizePhone(cliente.telefono);
-            // Pausar bot, informar al cliente que se busca asesor
-            await db.collection("chats").doc(clientPhoneN).set({
-                humanMode: true, seekingAgent: true,
-                unreadCount: admin.firestore.FieldValue.increment(1),
-                sentiment:   "urgente",
-            }, { merge: true });
-            await botResponder(cliente.telefono,
-                respuestaIA || `Entendido ${cliente.nombre}, estoy buscando un asesor disponible. Un momento... 🔍`
-            );
-            // Pasar info del cliente para que quede en la cola si nadie acepta
-            await ofrecerChatAAgente(clientPhoneN, cliente.nombre, textoOriginal, [], {
+            const clienteInfo  = {
                 direccion:  cliente.direccion || null,
                 deuda:      totalDebt > 0 ? fmt.format(totalDebt) : null,
                 mesesDeuda: monthsStr || null,
                 plan:       cliente.plan || null,
-            });
+            };
+
+            // Pausar bot
+            await db.collection("chats").doc(clientPhoneN).set({
+                humanMode: true, seekingAgent: true, inQueue: true,
+                unreadCount: admin.firestore.FieldValue.increment(1),
+                sentiment:   "urgente",
+            }, { merge: true });
+
+            // 1. Agregar SIEMPRE a la cola → el cliente ve su posición de inmediato
+            await agregarACola(clientPhoneN, cliente.nombre, textoOriginal, clienteInfo);
+
+            // 2. En paralelo intentar asignar un agente (si acepta, lo saca de la cola)
+            ofrecerDesdeColaEnParalelo(clientPhoneN, cliente.nombre, textoOriginal, clienteInfo);
             break;
         }
 
@@ -1548,14 +1551,26 @@ async function asignarAgenteOptimo(triedAgents = []) {
     }
 }
 
+// Wrapper no-bloqueante: ofrece agentes en paralelo a la cola ya creada
+async function ofrecerDesdeColaEnParalelo(clientPhone, clientName, textoOriginal, clienteInfo) {
+    try {
+        await ofrecerChatAAgente(clientPhone, clientName, textoOriginal, [], clienteInfo, true);
+    } catch (e) {
+        console.error("[ofrecerDesdeColaEnParalelo]", e.message);
+    }
+}
+
 // Ofrece el chat a un agente disponible; si ninguno → cola
-async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedAgents, clienteInfo = {}) {
+async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedAgents, clienteInfo = {}, yaEnCola = false) {
     const agente     = await asignarAgenteOptimo(triedAgents);
     const agentPhone = agente?.phone || null;
 
     if (!agente || !agentPhone) {
-        // Ningún agente disponible → cola con contexto completo
-        await agregarACola(clientPhone, clientName, textoOriginal, clienteInfo);
+        // Sin agentes disponibles
+        if (!yaEnCola) {
+            // Solo agregar a cola si no estaba ya (evita duplicar mensaje de posición)
+            await agregarACola(clientPhone, clientName, textoOriginal, clienteInfo);
+        }
         await db.collection("chats").doc(clientPhone).set({
             seekingAgent: false, inQueue: true,
         }, { merge: true });
@@ -1583,17 +1598,41 @@ async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedA
     );
 }
 
-// Agente acepta → crear relay y notificar al cliente
+// Agente acepta → sacar de cola, crear relay, notificar
 async function aceptarOferta(agentPhone, req) {
     const { clientPhone, clientName, agentName } = req;
     await db.collection("agent_pending_requests").doc(agentPhone).delete();
+
+    // Sacar de la cola (si estaba) y actualizar posiciones restantes
+    const queueSnap = await db.collection("waiting_queue")
+        .where("clientPhone", "==", clientPhone)
+        .where("status", "in", ["waiting", "pending_agent"]).get();
+    if (!queueSnap.empty) {
+        await queueSnap.docs[0].ref.update({
+            status: "attending", startedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        // Actualizar posiciones de los que siguen esperando
+        const remaining = await db.collection("waiting_queue")
+            .where("status", "==", "waiting").orderBy("joinedAt", "asc").get();
+        if (!remaining.empty) {
+            const batch = db.batch();
+            remaining.docs.forEach((d, i) => batch.update(d.ref, { position: i + 1 }));
+            await batch.commit();
+            remaining.docs.forEach((d, i) => {
+                enviarTexto(d.data().clientPhone,
+                    `📊 Avanzaste: ahora eres la posición *${i + 1}* en la cola.`
+                ).catch(() => {});
+            });
+        }
+    }
+
     await Promise.all([
         db.collection("agent_relay").doc(agentPhone).set({
             clientPhone, clientName, agentName,
             active: true, assignedAt: admin.firestore.FieldValue.serverTimestamp(),
         }),
         db.collection("chats").doc(clientPhone).set({
-            humanMode: true, seekingAgent: false,
+            humanMode: true, seekingAgent: false, inQueue: false,
             pendingAgent: null, pendingAgentPhone: null,
             assignedTo: agentName, agentPhone,
             atendidoPor: agentName,
@@ -1626,10 +1665,10 @@ async function rechazarOferta(agentPhone, req) {
         pendingAgent: null, pendingAgentPhone: null,
     }, { merge: true });
     await enviarTexto(agentPhone, `❌ Solicitud rechazada.`);
-    // Buscar siguiente agente (con info del cliente)
+    // Buscar siguiente agente (cliente ya en cola, no duplicar mensaje)
     await ofrecerChatAAgente(
         req.clientPhone, req.clientName, req.textoOriginal,
-        req.triedAgents || [], req.clienteInfo || {}
+        req.triedAgents || [], req.clienteInfo || {}, true
     );
 }
 
