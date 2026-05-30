@@ -517,21 +517,36 @@ async function procesarMensajeEntrante(message) {
 
     // ── En humanMode: reenviar mensaje del cliente al agente por WhatsApp ───────
     if (isHumanMode) {
-        const chatData   = chatDocSnap.exists ? chatDocSnap.data() : {};
-        const agentPhone = chatData.agentPhone;
+        // Leer siempre fresco para tener el agentPhone actualizado
+        const freshChat    = await db.collection("chats").doc(userPhone).get();
+        const agentPhone   = freshChat.exists ? freshChat.data().agentPhone : null;
+
         if (agentPhone) {
-            const relaySnap = await db.collection("agent_relay").doc(agentPhone).get();
-            if (relaySnap.exists && relaySnap.data().active) {
-                const textoCliente = message.message?.conversation ||
-                    message.message?.extendedTextMessage?.text ||
-                    (isImgMsg ? "[Imagen]" : isStickerMsg ? "[Sticker]" : "[Mensaje]");
-                // Texto
-                if (textoCliente !== "[Imagen]")
-                    enviarTexto(agentPhone, `💬 *${userName}*:\n${textoCliente}`).catch(() => {});
-                // Imagen
-                if (isImgMsg && imagePublicUrl)
-                    enviarImagen(agentPhone, imagePublicUrl, `📷 *${userName}*`).catch(() => {});
+            const textoCliente =
+                message.message?.conversation ||
+                message.message?.extendedTextMessage?.text ||
+                message.message?.imageMessage?.caption ||
+                message.message?.videoMessage?.caption ||
+                message.message?.documentMessage?.title ||
+                "";
+
+            // Reenviar texto
+            const label = textoCliente
+                ? `💬 *${userName}*:\n${textoCliente}`
+                : isImgMsg    ? `📷 *${userName}* envió una imagen`
+                : isStickerMsg ? `🎭 *${userName}* envió un sticker`
+                : `💬 *${userName}* envió un archivo`;
+
+            enviarTexto(agentPhone, label)
+                .catch(e => console.error("[RELAY→AGENTE texto]", e.message));
+
+            // Reenviar imagen si hay URL pública
+            if (isImgMsg && imagePublicUrl) {
+                enviarImagen(agentPhone, imagePublicUrl, `📷 ${userName}`)
+                    .catch(e => console.error("[RELAY→AGENTE img]", e.message));
             }
+        } else {
+            console.warn(`[RELAY] humanMode activo para ${userPhone} pero sin agentPhone asignado`);
         }
         return;
     }
