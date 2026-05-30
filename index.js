@@ -681,9 +681,11 @@ Responde SOLO con JSON válido sin texto adicional:
                     `🔔 *Chat asignado — ${agente.displayName}*\n\nCliente: *${cliente.nombre}*\n📞 ${cliente.telefono}\n📍 ${cliente.direccion || "Sin dirección"}\n\nEscribió:\n_"${textoOriginal.slice(0, 160)}"_\n\n✏️ Responde aquí directamente para chatear con el cliente.\nEscribe *fin* para cerrar la conversación.`
                 );
             } else {
-                await botResponder(cliente.telefono,
-                    respuestaIA || `Entendido ${cliente.nombre}, pauso el asistente. Un asesor humano te atenderá pronto. 🙋`
-                );
+                // Sin agente disponible → agregar a cola de espera
+                await agregarACola(normalizePhone(cliente.telefono), cliente.nombre);
+                await db.collection("chats").doc(normalizePhone(cliente.telefono)).set({
+                    humanMode: true, inQueue: true,
+                }, { merge: true });
             }
             break;
         }
@@ -1259,8 +1261,105 @@ function calcularDeudaCliente(cliente) {
     return { totalDebt, monthsStr: months.slice(0, 4).join(", ") + (months.length > 4 ? "..." : "") };
 }
 
-// Devuelve el agente activo con menos chats abiertos en humanMode asignados
-// Maneja el relay WhatsApp agente ↔ cliente
+// ── Cola de espera ────────────────────────────────────────────────────────────
+
+async function agregarACola(clientPhone, clientName, targetAgent = null) {
+    // No duplicar si ya está esperando
+    const existing = await db.collection("waiting_queue")
+        .where("clientPhone", "==", clientPhone)
+        .where("status", "==", "waiting").get();
+    if (!existing.empty) {
+        const pos = existing.docs[0].data().position || 1;
+        await enviarTexto(clientPhone, `Ya estás en la posición *${pos}* de la cola. Por favor espera. 🙏`);
+        return;
+    }
+    const allWaiting = await db.collection("waiting_queue").where("status", "==", "waiting").get();
+    const position   = allWaiting.size + 1;
+    const waitMin    = position * 4;
+    await db.collection("waiting_queue").add({
+        clientPhone, clientName,
+        targetAgent: targetAgent || null,
+        joinedAt:    admin.firestore.FieldValue.serverTimestamp(),
+        status:      "waiting",
+        position,
+    });
+    await enviarTexto(clientPhone,
+        `🕐 Todos nuestros agentes están ocupados ahora.\n\n` +
+        `*Tu posición en cola: ${position}*\n` +
+        `⏱ Tiempo estimado: ~${waitMin} minutos\n\n` +
+        `Te avisaremos cuando sea tu turno. ¡Gracias por tu paciencia! 🙏`
+    );
+}
+
+async function tomarSiguienteYAsignar(agentName, agentPhone) {
+    const snap = await db.collection("waiting_queue")
+        .where("status", "==", "waiting")
+        .orderBy("joinedAt", "asc").limit(1).get();
+    if (snap.empty) return;
+
+    const entry      = { id: snap.docs[0].id, ...snap.docs[0].data() };
+    const clientPhone = normalizePhone(entry.clientPhone);
+    const clientName  = entry.clientName;
+
+    // Marcar como atendiendo
+    await db.collection("waiting_queue").doc(entry.id).update({
+        status: "attending", startedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Actualizar posiciones de los demás
+    const remaining = await db.collection("waiting_queue")
+        .where("status", "==", "waiting").orderBy("joinedAt", "asc").get();
+    const batch = db.batch();
+    remaining.docs.forEach((d, i) => batch.update(d.ref, { position: i + 1 }));
+    if (!remaining.empty) await batch.commit();
+
+    // Notificar restantes de su nueva posición
+    remaining.docs.forEach((d, i) => {
+        const data = d.data();
+        if (data.clientPhone)
+            enviarTexto(data.clientPhone,
+                `📊 Actualización: ahora eres la posición *${i + 1}* en la cola.`
+            ).catch(() => {});
+    });
+
+    // Crear relay con el nuevo cliente
+    await db.collection("agent_relay").doc(agentPhone).set({
+        clientPhone, clientName, agentName,
+        active: true,
+        assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await db.collection("chats").doc(clientPhone).set({
+        humanMode: true, assignedTo: agentName, agentPhone,
+        atendidoPor: agentName, atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
+        atendidoHasta: null,
+    }, { merge: true });
+    await db.collection("chats").doc(clientPhone).collection("messages").add({
+        text: `👤 Asignado a *${agentName}* (desde cola de espera)`,
+        role: "note", direction: "note",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Avisar al cliente
+    await enviarTexto(clientPhone,
+        `🎉 ¡Es tu turno! *${agentName}* te atenderá ahora.\n\n¿En qué te puedo ayudar?`
+    );
+    // Avisar al agente
+    await enviarTexto(agentPhone,
+        `🔔 *Siguiente cliente de la cola*\n\nCliente: *${clientName}*\n📞 ${clientPhone}\n\n✏️ Responde aquí directamente.\nEscribe *fin* para cerrar.`
+    );
+}
+
+async function actualizarEstadisticasAgente(agentName, tipo) {
+    // tipo: 'attended' | 'abandoned' | 'satisfactionRating'
+    const ref = db.collection("agent_stats").doc(agentName);
+    const inc = admin.firestore.FieldValue.increment(1);
+    const updates = { lastUpdated: admin.firestore.FieldValue.serverTimestamp() };
+    if (tipo === "attended")  updates.totalAttended  = inc;
+    if (tipo === "abandoned") updates.totalAbandoned = inc;
+    await ref.set(updates, { merge: true });
+}
+
+// ── Maneja el relay WhatsApp agente ↔ cliente ─────────────────────────────────
 async function manejarRelayAgente(agentPhone, message, relayData, imageBuffer) {
     const { clientName, agentName } = relayData;
     const clientPhone = normalizePhone(relayData.clientPhone); // garantizar 12 dígitos
@@ -1273,27 +1372,45 @@ async function manejarRelayAgente(agentPhone, message, relayData, imageBuffer) {
     // Comando de cierre
     if (/^(fin|cerrar|terminar|end|listo)$/i.test(texto)) {
         const ahora = admin.firestore.FieldValue.serverTimestamp();
+        const surveyText =
+`✅ *¡Gracias por contactarnos, ${clientName}!*
+
+¿Cómo calificarías la atención de *${agentName}*?
+
+*1* 😞 Muy mala
+*2* 😕 Mala
+*3* 😐 Regular
+*4* 🙂 Buena
+*5* 😄 Excelente
+
+_Responde con el número para registrar tu valoración_ 🙏`;
+
         await Promise.all([
             db.collection("agent_relay").doc(agentPhone).update({ active: false }),
             db.collection("chats").doc(clientPhone).set({
-                humanMode:    false,
-                agentPhone:   null,
-                atendidoHasta: ahora,
+                humanMode: false, agentPhone: null, atendidoHasta: ahora,
+                surveyPending: true, surveyAt: ahora,
             }, { merge: true }),
-            // Nota de cierre con historial
             db.collection("chats").doc(clientPhone).collection("messages").add({
-                text:      `✅ Conversación cerrada por *${agentName}*`,
-                role:      "note",
-                direction: "note",
-                createdAt: ahora,
+                text: `✅ Conversación cerrada por *${agentName}*`,
+                role: "note", direction: "note", createdAt: ahora,
             }),
+            // Marcar entrada de cola como 'done'
+            db.collection("waiting_queue")
+                .where("clientPhone", "==", clientPhone).where("status", "==", "attending")
+                .get().then(snap => {
+                    if (!snap.empty) snap.docs[0].ref.update({ status: "done", endedAt: ahora });
+                }),
         ]);
-        await enviarTexto(agentPhone,
-            `✅ Conversación con *${clientName}* cerrada y registrada.`
-        );
-        await enviarTexto(clientPhone,
-            `✅ *Conversación finalizada*\n\nGracias por contactarnos, ${clientName}. Si necesitas algo más, escríbenos. 🙏`
-        );
+
+        // Estadísticas del agente
+        actualizarEstadisticasAgente(agentName, "attended").catch(() => {});
+
+        await enviarTexto(agentPhone, `✅ Chat con *${clientName}* cerrado. Encuesta enviada al cliente.`);
+        await enviarTexto(clientPhone, surveyText);
+
+        // Tomar siguiente de la cola automáticamente
+        setTimeout(() => tomarSiguienteYAsignar(agentName, agentPhone).catch(() => {}), 2000);
         return;
     }
 
