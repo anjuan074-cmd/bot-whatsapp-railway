@@ -601,16 +601,32 @@ Responde SOLO con JSON válido sin texto adicional:
 
     switch (intent) {
 
-        case "asesor":
+        case "asesor": {
+            const agente = await asignarAgenteOptimo();
             await db.collection("chats").doc(cliente.telefono).set({
-                humanMode: true,
+                humanMode:   true,
+                assignedTo:  agente ? agente.displayName : null,
                 unreadCount: admin.firestore.FieldValue.increment(1),
-                sentiment: "urgente",
+                sentiment:   "urgente",
             }, { merge: true });
-            await botResponder(cliente.telefono,
-                respuestaIA || `Entendido ${cliente.nombre}, pauso el asistente. Un asesor humano te atenderá pronto. 🙋`
-            );
+            if (agente) {
+                await botResponder(cliente.telefono,
+                    `Hola ${cliente.nombre}, a partir de ahora te atenderá *${agente.displayName}* 👋\n\n¿En qué te puedo ayudar?`
+                );
+                // Notificar al agente por WhatsApp si tiene teléfono registrado
+                if (agente.phone || agente.telefono) {
+                    botResponder(
+                        normalizePhone(agente.phone || agente.telefono),
+                        `🔔 *Chat asignado*\n\nCliente: *${cliente.nombre}*\n📞 ${cliente.telefono}\n\nEscribió:\n_"${textoOriginal.slice(0, 120)}"_`
+                    ).catch(() => {});
+                }
+            } else {
+                await botResponder(cliente.telefono,
+                    respuestaIA || `Entendido ${cliente.nombre}, pauso el asistente. Un asesor humano te atenderá pronto. 🙋`
+                );
+            }
             break;
+        }
 
         case "saldo":
             if (totalDebt > 0) {
@@ -1181,6 +1197,37 @@ function calcularDeudaCliente(cliente) {
     }
 
     return { totalDebt, monthsStr: months.slice(0, 4).join(", ") + (months.length > 4 ? "..." : "") };
+}
+
+// Devuelve el agente activo con menos chats abiertos en humanMode asignados
+async function asignarAgenteOptimo() {
+    try {
+        const [agentsSnap, chatsSnap] = await Promise.all([
+            db.collection("user_profiles").get(),
+            db.collection("chats").where("humanMode", "==", true).get(),
+        ]);
+
+        const agentes = agentsSnap.docs
+            .map(d => ({ id: d.id, ...d.data() }))
+            .filter(u => u.isActive !== false && u.displayName);
+
+        if (!agentes.length) return null;
+
+        // Contar chats no resueltos asignados a cada agente
+        const carga = {};
+        chatsSnap.docs.forEach(d => {
+            const { assignedTo, status } = d.data();
+            if (assignedTo && status !== "resolved")
+                carga[assignedTo] = (carga[assignedTo] || 0) + 1;
+        });
+
+        return agentes
+            .map(u => ({ ...u, carga: carga[u.displayName] || 0 }))
+            .sort((a, b) => a.carga - b.carga)[0];
+    } catch (e) {
+        console.error("[asignarAgenteOptimo]", e.message);
+        return null;
+    }
 }
 
 async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
