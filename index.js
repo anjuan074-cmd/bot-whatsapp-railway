@@ -517,11 +517,16 @@ async function procesarMensajeEntrante(message) {
 
     // ── En humanMode: reenviar mensaje del cliente al agente por WhatsApp ───────
     if (isHumanMode) {
-        // Leer siempre fresco para tener el agentPhone actualizado
-        const freshChat    = await db.collection("chats").doc(userPhone).get();
-        const agentPhone   = freshChat.exists ? freshChat.data().agentPhone : null;
+        const freshChat  = await db.collection("chats").doc(userPhone).get();
+        const agentPhone = freshChat.exists ? freshChat.data().agentPhone : null;
 
         if (agentPhone) {
+            // Usar nombre del cliente desde Firestore; pushName como fallback
+            const clientName =
+                cliente?.nombre ||
+                freshChat.data()?.userName ||
+                userName;
+
             const textoCliente =
                 message.message?.conversation ||
                 message.message?.extendedTextMessage?.text ||
@@ -530,23 +535,26 @@ async function procesarMensajeEntrante(message) {
                 message.message?.documentMessage?.title ||
                 "";
 
-            // Reenviar texto
-            const label = textoCliente
-                ? `💬 *${userName}*:\n${textoCliente}`
-                : isImgMsg    ? `📷 *${userName}* envió una imagen`
-                : isStickerMsg ? `🎭 *${userName}* envió un sticker`
-                : `💬 *${userName}* envió un archivo`;
-
-            enviarTexto(agentPhone, label)
-                .catch(e => console.error("[RELAY→AGENTE texto]", e.message));
-
-            // Reenviar imagen si hay URL pública
-            if (isImgMsg && imagePublicUrl) {
-                enviarImagen(agentPhone, imagePublicUrl, `📷 ${userName}`)
-                    .catch(e => console.error("[RELAY→AGENTE img]", e.message));
+            if (isImgMsg) {
+                // Imagen: enviar la imagen con nombre del cliente como caption
+                if (imagePublicUrl) {
+                    enviarImagen(agentPhone, imagePublicUrl,
+                        textoCliente ? `📷 *${clientName}*: ${textoCliente}` : `📷 *${clientName}*`
+                    ).catch(e => console.error("[RELAY→AGENTE img]", e.message));
+                } else {
+                    enviarTexto(agentPhone, `📷 *${clientName}* envió una imagen`)
+                        .catch(e => console.error("[RELAY→AGENTE img-txt]", e.message));
+                }
+            } else if (isStickerMsg) {
+                enviarTexto(agentPhone, `🎭 *${clientName}* envió un sticker`)
+                    .catch(e => console.error("[RELAY→AGENTE sticker]", e.message));
+            } else if (textoCliente) {
+                enviarTexto(agentPhone, `💬 *${clientName}*:\n${textoCliente}`)
+                    .catch(e => console.error("[RELAY→AGENTE txt]", e.message));
             }
+            // Si no hay texto ni imagen conocida, no enviar nada (evita mensajes vacíos)
         } else {
-            console.warn(`[RELAY] humanMode activo para ${userPhone} pero sin agentPhone asignado`);
+            console.warn(`[RELAY] humanMode activo para ${userPhone} pero sin agentPhone`);
         }
         return;
     }
