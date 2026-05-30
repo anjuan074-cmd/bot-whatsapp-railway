@@ -410,6 +410,14 @@ async function procesarMensajeEntrante(message) {
         }
     }
 
+    // ── Salida temprana: si este número tiene relay activo es un agente respondiendo
+    // Se debe procesar ANTES de guardarMensajeChat para no crear chat con el número del agente
+    const earlyRelaySnap = await db.collection("agent_relay").doc(userPhone).get();
+    if (earlyRelaySnap.exists && earlyRelaySnap.data().active) {
+        await manejarRelayAgente(userPhone, message, earlyRelaySnap.data(), imageBuffer);
+        return;
+    }
+
     // humanMode  → guardar mensaje ahora (con URL si se pudo subir)
     // bot + img  → posponer; procesarPago guardará el mensaje con imageUrl de pagos/
     // sticker    → guardar siempre con URL
@@ -638,14 +646,29 @@ Responde SOLO con JSON válido sin texto adicional:
                 sentiment:   "urgente",
             }, { merge: true });
             if (agente && agentPhone) {
-                // Crear relay bidireccional
-                await db.collection("agent_relay").doc(agentPhone).set({
-                    clientPhone: cliente.telefono,
-                    clientName:  cliente.nombre,
-                    agentName:   agente.displayName,
-                    active:      true,
-                    assignedAt:  admin.firestore.FieldValue.serverTimestamp(),
-                });
+                // Crear relay bidireccional + historial de auditoría
+                await Promise.all([
+                    db.collection("agent_relay").doc(agentPhone).set({
+                        clientPhone: cliente.telefono,
+                        clientName:  cliente.nombre,
+                        agentName:   agente.displayName,
+                        active:      true,
+                        assignedAt:  admin.firestore.FieldValue.serverTimestamp(),
+                    }),
+                    // Guardar quién atiende y cuándo en el chat
+                    db.collection("chats").doc(cliente.telefono).set({
+                        atendidoPor:   agente.displayName,
+                        atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
+                        atendidoHasta: null,
+                    }, { merge: true }),
+                    // Nota interna visible en la app
+                    db.collection("chats").doc(cliente.telefono).collection("messages").add({
+                        text:      `👤 Conversación asignada a *${agente.displayName}* (carga actual: ${agente.carga} chats)`,
+                        role:      "note",
+                        direction: "note",
+                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    }),
+                ]);
                 await botResponder(cliente.telefono,
                     `Hola ${cliente.nombre}, a partir de ahora te atenderá *${agente.displayName}* 👋\n\n¿En qué te puedo ayudar?`
                 );
@@ -1243,14 +1266,24 @@ async function manejarRelayAgente(agentPhone, message, relayData, imageBuffer) {
 
     // Comando de cierre
     if (/^(fin|cerrar|terminar|end|listo)$/i.test(texto)) {
+        const ahora = admin.firestore.FieldValue.serverTimestamp();
         await Promise.all([
             db.collection("agent_relay").doc(agentPhone).update({ active: false }),
-            db.collection("chats").doc(clientPhone).set(
-                { humanMode: false, agentPhone: null }, { merge: true }
-            ),
+            db.collection("chats").doc(clientPhone).set({
+                humanMode:    false,
+                agentPhone:   null,
+                atendidoHasta: ahora,
+            }, { merge: true }),
+            // Nota de cierre con historial
+            db.collection("chats").doc(clientPhone).collection("messages").add({
+                text:      `✅ Conversación cerrada por *${agentName}*`,
+                role:      "note",
+                direction: "note",
+                createdAt: ahora,
+            }),
         ]);
         await enviarTexto(agentPhone,
-            `✅ Conversación con *${clientName}* cerrada.`
+            `✅ Conversación con *${clientName}* cerrada y registrada.`
         );
         await enviarTexto(clientPhone,
             `✅ *Conversación finalizada*\n\nGracias por contactarnos, ${clientName}. Si necesitas algo más, escríbenos. 🙏`
