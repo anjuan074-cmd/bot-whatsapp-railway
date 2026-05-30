@@ -488,6 +488,13 @@ async function procesarMensajeEntrante(message) {
     const isStaff = !!staffMember;
 
     if (isStaff) {
+        // ── Relay activo: el agente responde desde su WhatsApp al cliente ────────
+        const relaySnap = await db.collection("agent_relay").doc(userPhone).get();
+        if (relaySnap.exists && relaySnap.data().active) {
+            await manejarRelayAgente(userPhone, message, relaySnap.data(), imageBuffer);
+            return;
+        }
+
         const texto = (
             message.message?.conversation ||
             message.message?.extendedTextMessage?.text ||
@@ -521,13 +528,32 @@ async function procesarMensajeEntrante(message) {
         return;
     }
 
-    if (!isHumanMode) {
-        const configData = configSnap.exists ? configSnap.data() : {};
-        if (!cliente) {
-            await manejarUsuarioDesconocido(userPhone, userName, message, configData);
-        } else {
-            await manejarClienteRegistrado(cliente, message, imageBuffer);
+    // ── En humanMode: reenviar mensaje del cliente al agente por WhatsApp ───────
+    if (isHumanMode) {
+        const chatData   = chatDocSnap.exists ? chatDocSnap.data() : {};
+        const agentPhone = chatData.agentPhone;
+        if (agentPhone) {
+            const relaySnap = await db.collection("agent_relay").doc(agentPhone).get();
+            if (relaySnap.exists && relaySnap.data().active) {
+                const textoCliente = message.message?.conversation ||
+                    message.message?.extendedTextMessage?.text ||
+                    (isImgMsg ? "[Imagen]" : isStickerMsg ? "[Sticker]" : "[Mensaje]");
+                // Texto
+                if (textoCliente !== "[Imagen]")
+                    enviarTexto(agentPhone, `💬 *${userName}*:\n${textoCliente}`).catch(() => {});
+                // Imagen
+                if (isImgMsg && imagePublicUrl)
+                    enviarImagen(agentPhone, imagePublicUrl, `📷 *${userName}*`).catch(() => {});
+            }
         }
+        return;
+    }
+
+    const configData = configSnap.exists ? configSnap.data() : {};
+    if (!cliente) {
+        await manejarUsuarioDesconocido(userPhone, userName, message, configData);
+    } else {
+        await manejarClienteRegistrado(cliente, message, imageBuffer);
     }
 }
 
@@ -602,24 +628,30 @@ Responde SOLO con JSON válido sin texto adicional:
     switch (intent) {
 
         case "asesor": {
-            const agente = await asignarAgenteOptimo();
+            const agente      = await asignarAgenteOptimo();
+            const agentPhone  = agente ? normalizePhone(agente.phone || agente.telefono || "") : null;
             await db.collection("chats").doc(cliente.telefono).set({
                 humanMode:   true,
                 assignedTo:  agente ? agente.displayName : null,
+                agentPhone:  agentPhone || null,
                 unreadCount: admin.firestore.FieldValue.increment(1),
                 sentiment:   "urgente",
             }, { merge: true });
-            if (agente) {
+            if (agente && agentPhone) {
+                // Crear relay bidireccional
+                await db.collection("agent_relay").doc(agentPhone).set({
+                    clientPhone: cliente.telefono,
+                    clientName:  cliente.nombre,
+                    agentName:   agente.displayName,
+                    active:      true,
+                    assignedAt:  admin.firestore.FieldValue.serverTimestamp(),
+                });
                 await botResponder(cliente.telefono,
                     `Hola ${cliente.nombre}, a partir de ahora te atenderá *${agente.displayName}* 👋\n\n¿En qué te puedo ayudar?`
                 );
-                // Notificar al agente por WhatsApp si tiene teléfono registrado
-                if (agente.phone || agente.telefono) {
-                    botResponder(
-                        normalizePhone(agente.phone || agente.telefono),
-                        `🔔 *Chat asignado*\n\nCliente: *${cliente.nombre}*\n📞 ${cliente.telefono}\n\nEscribió:\n_"${textoOriginal.slice(0, 120)}"_`
-                    ).catch(() => {});
-                }
+                await enviarTexto(agentPhone,
+                    `🔔 *Chat asignado — ${agente.displayName}*\n\nCliente: *${cliente.nombre}*\n📞 ${cliente.telefono}\n📍 ${cliente.direccion || "Sin dirección"}\n\nEscribió:\n_"${textoOriginal.slice(0, 160)}"_\n\n✏️ Responde aquí directamente para chatear con el cliente.\nEscribe *fin* para cerrar la conversación.`
+                );
             } else {
                 await botResponder(cliente.telefono,
                     respuestaIA || `Entendido ${cliente.nombre}, pauso el asistente. Un asesor humano te atenderá pronto. 🙋`
@@ -1200,6 +1232,74 @@ function calcularDeudaCliente(cliente) {
 }
 
 // Devuelve el agente activo con menos chats abiertos en humanMode asignados
+// Maneja el relay WhatsApp agente ↔ cliente
+async function manejarRelayAgente(agentPhone, message, relayData, imageBuffer) {
+    const { clientPhone, clientName, agentName } = relayData;
+    const texto = (
+        message.message?.conversation ||
+        message.message?.extendedTextMessage?.text ||
+        message.message?.imageMessage?.caption || ""
+    ).trim();
+
+    // Comando de cierre
+    if (/^(fin|cerrar|terminar|end|listo)$/i.test(texto)) {
+        await Promise.all([
+            db.collection("agent_relay").doc(agentPhone).update({ active: false }),
+            db.collection("chats").doc(clientPhone).set(
+                { humanMode: false, agentPhone: null }, { merge: true }
+            ),
+        ]);
+        await enviarTexto(agentPhone,
+            `✅ Conversación con *${clientName}* cerrada.`
+        );
+        await enviarTexto(clientPhone,
+            `✅ *Conversación finalizada*\n\nGracias por contactarnos, ${clientName}. Si necesitas algo más, escríbenos. 🙏`
+        );
+        return;
+    }
+
+    // Reenviar imagen al cliente
+    if (imageBuffer) {
+        try {
+            const bucket   = admin.storage().bucket();
+            const fileName = `chats/relay/${clientPhone}_${Date.now()}.jpg`;
+            const file     = bucket.file(fileName);
+            await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
+            await file.makePublic();
+            const url = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+            await enviarImagen(clientPhone, url, texto || "");
+            await Promise.all([
+                db.collection("chats").doc(clientPhone).collection("messages").add({
+                    text: texto || "[Imagen]", type: "image", imageUrl: url,
+                    direction: "out", role: "asesor",
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(), ack: 1,
+                }),
+                db.collection("chats").doc(clientPhone).set({
+                    lastMessage: "[Imagen]",
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                    lastMessageDirection: "out",
+                }, { merge: true }),
+            ]);
+        } catch (e) { console.error("[relay img]", e.message); }
+        return;
+    }
+
+    // Reenviar texto al cliente
+    if (!texto) return;
+    await enviarTexto(clientPhone, texto);
+    await Promise.all([
+        db.collection("chats").doc(clientPhone).collection("messages").add({
+            text: texto, direction: "out", role: "asesor",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(), ack: 1,
+        }),
+        db.collection("chats").doc(clientPhone).set({
+            lastMessage: texto,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            lastMessageDirection: "out",
+        }, { merge: true }),
+    ]);
+}
+
 async function asignarAgenteOptimo() {
     try {
         const [agentsSnap, chatsSnap] = await Promise.all([
