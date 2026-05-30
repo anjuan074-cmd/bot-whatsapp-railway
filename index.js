@@ -553,7 +553,27 @@ async function procesarMensajeEntrante(message) {
     // ── En humanMode: reenviar mensaje del cliente al agente por WhatsApp ───────
     if (isHumanMode) {
         const freshChat  = await db.collection("chats").doc(userPhone).get();
-        const agentPhone = freshChat.exists ? freshChat.data().agentPhone : null;
+        const chatData   = freshChat.exists ? freshChat.data() : {};
+        const agentPhone = chatData.agentPhone || null;
+
+        // Si el cliente está en cola (sin agente asignado), guardar sus mensajes como contexto
+        if (!agentPhone && chatData.inQueue) {
+            const textoNuevo = message.message?.conversation ||
+                message.message?.extendedTextMessage?.text || "";
+            if (textoNuevo) {
+                // Actualizar descripción en la entrada de cola
+                const queueSnap = await db.collection("waiting_queue")
+                    .where("clientPhone", "==", userPhone)
+                    .where("status", "in", ["waiting", "pending_agent"]).get();
+                if (!queueSnap.empty) {
+                    await queueSnap.docs[0].ref.update({ textoActualizado: textoNuevo });
+                    await enviarTexto(userPhone,
+                        `📝 Anotado. El asesor verá tu mensaje cuando te atienda. ¡Sigue en cola! 🙏`
+                    );
+                }
+            }
+            return;
+        }
 
         if (agentPhone) {
             // Usar nombre del cliente desde Firestore; pushName como fallback
@@ -687,8 +707,13 @@ Responde SOLO con JSON válido sin texto adicional:
             await botResponder(cliente.telefono,
                 respuestaIA || `Entendido ${cliente.nombre}, estoy buscando un asesor disponible. Un momento... 🔍`
             );
-            // Ofrecer a primer agente disponible (él debe confirmar)
-            await ofrecerChatAAgente(clientPhoneN, cliente.nombre, textoOriginal, []);
+            // Pasar info del cliente para que quede en la cola si nadie acepta
+            await ofrecerChatAAgente(clientPhoneN, cliente.nombre, textoOriginal, [], {
+                direccion:  cliente.direccion || null,
+                deuda:      totalDebt > 0 ? fmt.format(totalDebt) : null,
+                mesesDeuda: monthsStr || null,
+                plan:       cliente.plan || null,
+            });
             break;
         }
 
@@ -1265,89 +1290,107 @@ function calcularDeudaCliente(cliente) {
 
 // ── Cola de espera ────────────────────────────────────────────────────────────
 
-async function agregarACola(clientPhone, clientName, targetAgent = null) {
+async function agregarACola(clientPhone, clientName, textoOriginal = null, clienteInfo = {}) {
     // No duplicar si ya está esperando
     const existing = await db.collection("waiting_queue")
         .where("clientPhone", "==", clientPhone)
         .where("status", "==", "waiting").get();
     if (!existing.empty) {
-        const pos = existing.docs[0].data().position || 1;
+        const entry = existing.docs[0].data();
+        const pos   = entry.position || 1;
+        // Actualizar descripción si el cliente agrega más contexto
+        if (textoOriginal && textoOriginal !== entry.textoOriginal) {
+            await existing.docs[0].ref.update({ textoActualizado: textoOriginal });
+        }
         await enviarTexto(clientPhone, `Ya estás en la posición *${pos}* de la cola. Por favor espera. 🙏`);
         return;
     }
     const allWaiting = await db.collection("waiting_queue").where("status", "==", "waiting").get();
     const position   = allWaiting.size + 1;
     const waitMin    = position * 4;
+
     await db.collection("waiting_queue").add({
         clientPhone, clientName,
-        targetAgent: targetAgent || null,
-        joinedAt:    admin.firestore.FieldValue.serverTimestamp(),
-        status:      "waiting",
+        textoOriginal:  textoOriginal || null,
+        textoActualizado: null,
+        clienteInfo: {
+            direccion:   clienteInfo.direccion   || null,
+            deuda:       clienteInfo.deuda       || null,
+            mesesDeuda:  clienteInfo.mesesDeuda  || null,
+            plan:        clienteInfo.plan        || null,
+        },
+        joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+        status:   "waiting",
         position,
     });
+
     await enviarTexto(clientPhone,
         `🕐 Todos nuestros agentes están ocupados ahora.\n\n` +
         `*Tu posición en cola: ${position}*\n` +
         `⏱ Tiempo estimado: ~${waitMin} minutos\n\n` +
-        `Te avisaremos cuando sea tu turno. ¡Gracias por tu paciencia! 🙏`
+        `Mientras esperas, cuéntanos brevemente tu problema para que el asesor llegue preparado. 📝`
     );
 }
 
+// Toma el siguiente de la cola y le ofrece al agente con confirmación SI/NO
 async function tomarSiguienteYAsignar(agentName, agentPhone) {
     const snap = await db.collection("waiting_queue")
         .where("status", "==", "waiting")
         .orderBy("joinedAt", "asc").limit(1).get();
-    if (snap.empty) return;
+    if (snap.empty) {
+        await enviarTexto(agentPhone, `✅ No hay más clientes en cola. ¡Buen trabajo!`);
+        return;
+    }
 
-    const entry      = { id: snap.docs[0].id, ...snap.docs[0].data() };
+    const entry       = { id: snap.docs[0].id, ...snap.docs[0].data() };
     const clientPhone = normalizePhone(entry.clientPhone);
     const clientName  = entry.clientName;
+    const descripcion = entry.textoActualizado || entry.textoOriginal || "Sin descripción";
+    const info        = entry.clienteInfo || {};
 
-    // Marcar como atendiendo
-    await db.collection("waiting_queue").doc(entry.id).update({
-        status: "attending", startedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Marcar como "pending" mientras el agente confirma
+    await snap.docs[0].ref.update({ status: "pending_agent" });
 
-    // Actualizar posiciones de los demás
+    // Actualizar posiciones restantes
     const remaining = await db.collection("waiting_queue")
         .where("status", "==", "waiting").orderBy("joinedAt", "asc").get();
-    const batch = db.batch();
-    remaining.docs.forEach((d, i) => batch.update(d.ref, { position: i + 1 }));
-    if (!remaining.empty) await batch.commit();
-
-    // Notificar restantes de su nueva posición
-    remaining.docs.forEach((d, i) => {
-        const data = d.data();
-        if (data.clientPhone)
-            enviarTexto(data.clientPhone,
-                `📊 Actualización: ahora eres la posición *${i + 1}* en la cola.`
+    if (!remaining.empty) {
+        const batch = db.batch();
+        remaining.docs.forEach((d, i) => batch.update(d.ref, { position: i + 1 }));
+        await batch.commit();
+        remaining.docs.forEach((d, i) => {
+            enviarTexto(d.data().clientPhone,
+                `📊 Avanzaste: ahora eres la posición *${i + 1}* en la cola.`
             ).catch(() => {});
+        });
+    }
+
+    // Guardar solicitud pendiente del agente con contexto completo del cliente
+    const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000));
+    await db.collection("agent_pending_requests").doc(agentPhone).set({
+        clientPhone, clientName,
+        textoOriginal:  descripcion,
+        agentName,
+        fromQueue:      true,
+        queueEntryId:   entry.id,
+        requestedAt:    admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt,
+        triedAgents:    [agentPhone],
     });
 
-    // Crear relay con el nuevo cliente
-    await db.collection("agent_relay").doc(agentPhone).set({
-        clientPhone, clientName, agentName,
-        active: true,
-        assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    await db.collection("chats").doc(clientPhone).set({
-        humanMode: true, assignedTo: agentName, agentPhone,
-        atendidoPor: agentName, atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
-        atendidoHasta: null,
-    }, { merge: true });
-    await db.collection("chats").doc(clientPhone).collection("messages").add({
-        text: `👤 Asignado a *${agentName}* (desde cola de espera)`,
-        role: "note", direction: "note",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    // Construir resumen del cliente para el agente
+    const resumen = [
+        `🗣 *Motivo:* "${descripcion.slice(0, 200)}"`,
+        info.deuda      ? `💰 Deuda: *${info.deuda}* (${info.mesesDeuda || ""})` : null,
+        info.direccion  ? `📍 ${info.direccion}` : null,
+        info.plan       ? `📡 Plan: ${info.plan}` : null,
+    ].filter(Boolean).join("\n");
 
-    // Avisar al cliente
-    await enviarTexto(clientPhone,
-        `🎉 ¡Es tu turno! *${agentName}* te atenderá ahora.\n\n¿En qué te puedo ayudar?`
-    );
-    // Avisar al agente
     await enviarTexto(agentPhone,
-        `🔔 *Siguiente cliente de la cola*\n\nCliente: *${clientName}*\n📞 ${clientPhone}\n\n✏️ Responde aquí directamente.\nEscribe *fin* para cerrar.`
+        `🔔 *Siguiente cliente de la cola*\n\n` +
+        `Cliente: *${clientName}*\n📞 ${clientPhone}\n\n` +
+        `${resumen}\n\n` +
+        `✅ Responde *SI* para aceptar | ❌ *NO* para pasar\n⏱ Tienes 5 minutos`
     );
 }
 
@@ -1506,13 +1549,13 @@ async function asignarAgenteOptimo(triedAgents = []) {
 }
 
 // Ofrece el chat a un agente disponible; si ninguno → cola
-async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedAgents) {
+async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedAgents, clienteInfo = {}) {
     const agente     = await asignarAgenteOptimo(triedAgents);
     const agentPhone = agente?.phone || null;
 
     if (!agente || !agentPhone) {
-        // Ningún agente disponible → cola de espera
-        await agregarACola(clientPhone, clientName);
+        // Ningún agente disponible → cola con contexto completo
+        await agregarACola(clientPhone, clientName, textoOriginal, clienteInfo);
         await db.collection("chats").doc(clientPhone).set({
             seekingAgent: false, inQueue: true,
         }, { merge: true });
@@ -1574,12 +1617,20 @@ async function aceptarOferta(agentPhone, req) {
 // Agente rechaza → intentar con siguiente agente
 async function rechazarOferta(agentPhone, req) {
     await db.collection("agent_pending_requests").doc(agentPhone).delete();
+    // Si venía de cola, volver a ponerlo en espera
+    if (req.fromQueue && req.queueEntryId) {
+        await db.collection("waiting_queue").doc(req.queueEntryId)
+            .update({ status: "waiting" }).catch(() => {});
+    }
     await db.collection("chats").doc(req.clientPhone).set({
         pendingAgent: null, pendingAgentPhone: null,
     }, { merge: true });
     await enviarTexto(agentPhone, `❌ Solicitud rechazada.`);
-    // Buscar siguiente agente
-    await ofrecerChatAAgente(req.clientPhone, req.clientName, req.textoOriginal, req.triedAgents || []);
+    // Buscar siguiente agente (con info del cliente)
+    await ofrecerChatAAgente(
+        req.clientPhone, req.clientName, req.textoOriginal,
+        req.triedAgents || [], req.clienteInfo || {}
+    );
 }
 
 async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
