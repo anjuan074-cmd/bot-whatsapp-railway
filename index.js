@@ -349,7 +349,8 @@ async function procesarMensajeEntrante(message) {
     if ((await msgRef.get()).exists) return;
     await msgRef.set({ ts: admin.firestore.FieldValue.serverTimestamp() });
 
-    const isImgMsg = ["imageMessage", "image"].includes(msgType);
+    const isImgMsg     = ["imageMessage", "image"].includes(msgType);
+    const isStickerMsg = msgType === "stickerMessage";
 
     // Leer estado del chat PRIMERO para saber si es humanMode
     // (necesario antes de decidir si subir imagen a Storage)
@@ -389,14 +390,37 @@ async function procesarMensajeEntrante(message) {
         }
     }
 
+    // Descargar y subir sticker a Storage para mostrarlo en el panel
+    let stickerPublicUrl = null;
+    if (isStickerMsg) {
+        try {
+            const buf = await downloadMediaMessage(message, "buffer", {}, {
+                logger: console, reuploadRequest: sock.updateMediaMessage,
+            });
+            if (buf) {
+                const bucket   = admin.storage().bucket();
+                const fileName = `chat/stickers/${userPhone}_${Date.now()}.webp`;
+                const file     = bucket.file(fileName);
+                await file.save(buf, { metadata: { contentType: "image/webp" } });
+                await file.makePublic();
+                stickerPublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+            }
+        } catch (e) {
+            console.error("[STICKER] Error descargando/subiendo sticker:", e.message);
+        }
+    }
+
     // humanMode  → guardar mensaje ahora (con URL si se pudo subir)
     // bot + img  → posponer; procesarPago guardará el mensaje con imageUrl de pagos/
+    // sticker    → guardar siempre con URL
     // texto/otro → guardar ahora
     const [, excusaSnap, cliente] = await Promise.all([
         (isImgMsg && !isHumanMode)
             ? Promise.resolve()
             : guardarMensajeChat(userPhone, message, "in", userName,
-                imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" } : {}),
+                stickerPublicUrl ? { imageUrl: stickerPublicUrl, type: "stickerMessage" }
+                : imagePublicUrl ? { imageUrl: imagePublicUrl, type: "image" }
+                : {}),
         db.collection("esperando_excusa").doc(userPhone).get(),
         obtenerClientePorTelefono(userPhone),
     ]);
@@ -3045,6 +3069,18 @@ async function enviarImagen(phone, imageSource, caption = "") {
     }
 }
 
+async function enviarSticker(phone, stickerUrl) {
+    if (!sock || !isConnected) return null;
+    const jid = toJID(phone);
+    try {
+        const sent = await sock.sendMessage(jid, { sticker: { url: stickerUrl } });
+        return sent?.key?.id || null;
+    } catch (err) {
+        console.error(`❌ Error enviando sticker a ${jid}:`, err.message);
+        return null;
+    }
+}
+
 // ==========================================
 // SERVIDOR EXPRESS
 // ==========================================
@@ -3196,6 +3232,39 @@ app.post("/confirmarPago", auth, async (req, res) => {
     ]);
 
     res.json({ success: !!msgId, msgId });
+});
+
+// ── POST /enviarSticker ────────────────────────────────────────────────────────
+// Recibe: { telefono, url }  — url pública de la imagen en Firebase Storage
+app.post("/enviarSticker", auth, async (req, res) => {
+    const { telefono, url } = req.body;
+    if (!telefono || !url) return res.status(400).json({ error: "Faltan datos" });
+    if (!sock || !isConnected) return res.status(503).json({ error: "WhatsApp desconectado" });
+    try {
+        const msgId   = await enviarSticker(telefono, url);
+        const chatId  = normalizePhone(telefono);
+        const chatRef = db.collection("chats").doc(chatId);
+        await Promise.all([
+            chatRef.set({
+                lastMessage: "[Sticker]",
+                lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                lastMessageDirection: "out",
+            }, { merge: true }),
+            chatRef.collection("messages").add({
+                type: "stickerMessage",
+                text: { body: "[Sticker]" },
+                direction: "out",
+                imageUrl: url,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                ack: 1,
+                ...(msgId && { waMessageId: msgId }),
+            }),
+        ]);
+        res.json({ success: !!msgId, msgId });
+    } catch (e) {
+        console.error("Error /enviarSticker:", e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ── POST /enviarCampana ────────────────────────────────────────────────────────
