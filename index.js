@@ -360,13 +360,38 @@ async function procesarMensajeEntrante(message) {
         db.collection("user_profiles").get(),
     ]);
 
-    // ── SALIDA INMEDIATA: agente con relay activo — ANTES de cualquier escritura ──
+    // ── SALIDA INMEDIATA: agente con relay activo ────────────────────────────────
     if (earlyRelaySnap.exists && earlyRelaySnap.data().active) {
         let imgBuf = null;
         if (isImgMsg) {
             try { imgBuf = await downloadMediaMessage(message, "buffer", {}, { logger: console, reuploadRequest: sock.updateMediaMessage }); } catch {}
         }
         await manejarRelayAgente(userPhone, message, earlyRelaySnap.data(), imgBuf);
+        return;
+    }
+
+    // ── SALIDA INMEDIATA: agente respondiendo solicitud pendiente (SI / NO) ───────
+    const pendingReqSnap = await db.collection("agent_pending_requests").doc(userPhone).get();
+    if (pendingReqSnap.exists) {
+        const req    = pendingReqSnap.data();
+        const texto  = (message.message?.conversation || message.message?.extendedTextMessage?.text || "").trim().toLowerCase();
+        const now    = Date.now();
+        const expired = (req.expiresAt?.seconds || 0) * 1000 < now;
+
+        if (expired) {
+            // Solicitud expirada → rechazar automáticamente
+            await rechazarOferta(userPhone, req);
+            await enviarTexto(userPhone, `⏱ La solicitud expiró (5 min). Buscando otro asesor para ${req.clientName}...`);
+        } else if (/^(si|sí|yes|aceptar|acepto|ok|dale)$/i.test(texto)) {
+            await aceptarOferta(userPhone, req);
+        } else if (/^(no|rechazar|rechazo|cancelar|ocupado)$/i.test(texto)) {
+            await rechazarOferta(userPhone, req);
+        } else {
+            // Cualquier otro mensaje → recordar que debe responder
+            await enviarTexto(userPhone,
+                `⚠️ Tienes una solicitud pendiente de *${req.clientName}*.\nResponde *SI* para aceptar o *NO* para rechazar.`
+            );
+        }
         return;
     }
 
@@ -652,51 +677,18 @@ Responde SOLO con JSON válido sin texto adicional:
     switch (intent) {
 
         case "asesor": {
-            const agente       = await asignarAgenteOptimo();
-            const agentPhone   = agente ? normalizePhone(agente.phone || agente.telefono || "") : null;
-            const clientPhoneN = normalizePhone(cliente.telefono); // siempre 12 dígitos
+            const clientPhoneN = normalizePhone(cliente.telefono);
+            // Pausar bot, informar al cliente que se busca asesor
             await db.collection("chats").doc(clientPhoneN).set({
-                humanMode:   true,
-                assignedTo:  agente ? agente.displayName : null,
-                agentPhone:  agentPhone || null,
+                humanMode: true, seekingAgent: true,
                 unreadCount: admin.firestore.FieldValue.increment(1),
                 sentiment:   "urgente",
             }, { merge: true });
-            if (agente && agentPhone) {
-                // Crear relay bidireccional + historial de auditoría
-                await Promise.all([
-                    db.collection("agent_relay").doc(agentPhone).set({
-                        clientPhone: clientPhoneN,   // normalizado
-                        clientName:  cliente.nombre,
-                        agentName:   agente.displayName,
-                        active:      true,
-                        assignedAt:  admin.firestore.FieldValue.serverTimestamp(),
-                    }),
-                    db.collection("chats").doc(clientPhoneN).set({
-                        atendidoPor:   agente.displayName,
-                        atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
-                        atendidoHasta: null,
-                    }, { merge: true }),
-                    db.collection("chats").doc(clientPhoneN).collection("messages").add({
-                        text:      `👤 Conversación asignada a *${agente.displayName}* (carga: ${agente.carga} chats)`,
-                        role:      "note",
-                        direction: "note",
-                        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    }),
-                ]);
-                await botResponder(cliente.telefono,
-                    `Hola ${cliente.nombre}, a partir de ahora te atenderá *${agente.displayName}* 👋\n\n¿En qué te puedo ayudar?`
-                );
-                await enviarTexto(agentPhone,
-                    `🔔 *Chat asignado — ${agente.displayName}*\n\nCliente: *${cliente.nombre}*\n📞 ${cliente.telefono}\n📍 ${cliente.direccion || "Sin dirección"}\n\nEscribió:\n_"${textoOriginal.slice(0, 160)}"_\n\n✏️ Responde aquí directamente para chatear con el cliente.\nEscribe *fin* para cerrar la conversación.`
-                );
-            } else {
-                // Sin agente disponible → agregar a cola de espera
-                await agregarACola(normalizePhone(cliente.telefono), cliente.nombre);
-                await db.collection("chats").doc(normalizePhone(cliente.telefono)).set({
-                    humanMode: true, inQueue: true,
-                }, { merge: true });
-            }
+            await botResponder(cliente.telefono,
+                respuestaIA || `Entendido ${cliente.nombre}, estoy buscando un asesor disponible. Un momento... 🔍`
+            );
+            // Ofrecer a primer agente disponible (él debe confirmar)
+            await ofrecerChatAAgente(clientPhoneN, cliente.nombre, textoOriginal, []);
             break;
         }
 
@@ -1466,20 +1458,36 @@ _Responde con el número para registrar tu valoración_ 🙏`;
     ]);
 }
 
-async function asignarAgenteOptimo() {
+// Devuelve agente disponible omitiendo los ya intentados y con solicitud pendiente
+async function asignarAgenteOptimo(triedAgents = []) {
     try {
-        const [agentsSnap, chatsSnap] = await Promise.all([
+        const now = Date.now();
+        const [agentsSnap, chatsSnap, pendingSnap] = await Promise.all([
             db.collection("user_profiles").get(),
             db.collection("chats").where("humanMode", "==", true).get(),
+            db.collection("agent_pending_requests").get(),
         ]);
+
+        // Teléfonos con solicitud pendiente no expirada
+        const pendingPhones = new Set(
+            pendingSnap.docs
+                .filter(d => (d.data().expiresAt?.seconds || 0) * 1000 > now)
+                .map(d => d.id)
+        );
 
         const agentes = agentsSnap.docs
             .map(d => ({ id: d.id, ...d.data() }))
-            .filter(u => u.isActive !== false && u.displayName);
+            .filter(u => {
+                if (u.isActive === false || !u.displayName) return false;
+                const phone = normalizePhone(u.phone || u.telefono || "");
+                if (!phone) return false;
+                if (triedAgents.includes(phone)) return false;
+                if (pendingPhones.has(phone))    return false;
+                return true;
+            });
 
         if (!agentes.length) return null;
 
-        // Contar chats no resueltos asignados a cada agente
         const carga = {};
         chatsSnap.docs.forEach(d => {
             const { assignedTo, status } = d.data();
@@ -1488,12 +1496,90 @@ async function asignarAgenteOptimo() {
         });
 
         return agentes
-            .map(u => ({ ...u, carga: carga[u.displayName] || 0 }))
+            .map(u => ({ ...u, carga: carga[u.displayName] || 0,
+                          phone: normalizePhone(u.phone || u.telefono || "") }))
             .sort((a, b) => a.carga - b.carga)[0];
     } catch (e) {
         console.error("[asignarAgenteOptimo]", e.message);
         return null;
     }
+}
+
+// Ofrece el chat a un agente disponible; si ninguno → cola
+async function ofrecerChatAAgente(clientPhone, clientName, textoOriginal, triedAgents) {
+    const agente     = await asignarAgenteOptimo(triedAgents);
+    const agentPhone = agente?.phone || null;
+
+    if (!agente || !agentPhone) {
+        // Ningún agente disponible → cola de espera
+        await agregarACola(clientPhone, clientName);
+        await db.collection("chats").doc(clientPhone).set({
+            seekingAgent: false, inQueue: true,
+        }, { merge: true });
+        return;
+    }
+
+    const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 5 * 60 * 1000));
+
+    await Promise.all([
+        db.collection("agent_pending_requests").doc(agentPhone).set({
+            clientPhone, clientName,
+            textoOriginal: (textoOriginal || "").slice(0, 200),
+            agentName:   agente.displayName,
+            requestedAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt,
+            triedAgents: [...triedAgents, agentPhone],
+        }),
+        db.collection("chats").doc(clientPhone).set({
+            pendingAgent: agente.displayName, pendingAgentPhone: agentPhone,
+        }, { merge: true }),
+    ]);
+
+    await enviarTexto(agentPhone,
+        `🔔 *Solicitud de atención*\n\nCliente: *${clientName}*\n📞 ${clientPhone}\n\nMensaje:\n_"${(textoOriginal || "").slice(0, 160)}"_\n\n✅ Responde *SI* para aceptar\n❌ Responde *NO* para rechazar\n\n⏱ Tienes 5 minutos`
+    );
+}
+
+// Agente acepta → crear relay y notificar al cliente
+async function aceptarOferta(agentPhone, req) {
+    const { clientPhone, clientName, agentName } = req;
+    await db.collection("agent_pending_requests").doc(agentPhone).delete();
+    await Promise.all([
+        db.collection("agent_relay").doc(agentPhone).set({
+            clientPhone, clientName, agentName,
+            active: true, assignedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }),
+        db.collection("chats").doc(clientPhone).set({
+            humanMode: true, seekingAgent: false,
+            pendingAgent: null, pendingAgentPhone: null,
+            assignedTo: agentName, agentPhone,
+            atendidoPor: agentName,
+            atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
+            atendidoHasta: null,
+        }, { merge: true }),
+        db.collection("chats").doc(clientPhone).collection("messages").add({
+            text: `👤 *${agentName}* aceptó atenderte`,
+            role: "note", direction: "note",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        }),
+    ]);
+    await enviarTexto(agentPhone,
+        `✅ *Chat aceptado*\n\nCliente: *${clientName}* | 📞 ${clientPhone}\n\n✏️ Responde aquí directamente.\nEscribe *fin* para cerrar.`
+    );
+    await enviarTexto(clientPhone,
+        `Hola ${clientName}, a partir de ahora te atenderá *${agentName}* 👋\n\n¿En qué te puedo ayudar?`
+    );
+}
+
+// Agente rechaza → intentar con siguiente agente
+async function rechazarOferta(agentPhone, req) {
+    await db.collection("agent_pending_requests").doc(agentPhone).delete();
+    await db.collection("chats").doc(req.clientPhone).set({
+        pendingAgent: null, pendingAgentPhone: null,
+    }, { merge: true });
+    await enviarTexto(agentPhone, `❌ Solicitud rechazada.`);
+    // Buscar siguiente agente
+    await ofrecerChatAAgente(req.clientPhone, req.clientName, req.textoOriginal, req.triedAgents || []);
 }
 
 async function crearTicket(cliente, tipo, descripcion, mensajeIA) {
