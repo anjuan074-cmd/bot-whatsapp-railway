@@ -463,11 +463,21 @@ async function procesarMensajeEntrante(message) {
         const rating   = parseInt(textoRaw, 10);
         if (rating >= 1 && rating <= 5 && textoRaw === String(rating)) {
             const emojis = { 1:"😞", 2:"😕", 3:"😐", 4:"🙂", 5:"😄" };
+            const chatData = chatDocSnap.exists ? chatDocSnap.data() : {};
             await db.collection("chats").doc(userPhone).set({
                 surveyPending:      false,
                 satisfactionRating: rating,
                 satisfactionAt:     admin.firestore.FieldValue.serverTimestamp(),
             }, { merge: true });
+            // Actualizar promedio de satisfacción del agente
+            if (chatData.atendidoPor) {
+                const statsRef  = db.collection("agent_stats").doc(chatData.atendidoPor);
+                const statsSnap = await statsRef.get();
+                const prev      = statsSnap.exists ? statsSnap.data() : {};
+                const count     = (prev.satisfactionCount || 0) + 1;
+                const avg       = ((prev.avgSatisfaction || 0) * (count - 1) + rating) / count;
+                await statsRef.set({ satisfactionCount: count, avgSatisfaction: avg }, { merge: true });
+            }
             await botResponder(userPhone,
                 `${emojis[rating]} ¡Gracias por tu valoración!\n\nTu calificación de *${rating}/5* ha sido registrada. Tu opinión nos ayuda a seguir mejorando. 🙏`
             );
