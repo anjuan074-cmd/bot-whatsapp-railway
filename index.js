@@ -448,6 +448,24 @@ async function procesarMensajeEntrante(message) {
         return;
     }
 
+    // ── Encuesta de satisfacción: detectar respuesta 1-5 ─────────────────────
+    if (msgType === "conversation" && chatDocSnap.exists && chatDocSnap.data().surveyPending) {
+        const textoRaw = (message.message?.conversation || "").trim();
+        const rating   = parseInt(textoRaw, 10);
+        if (rating >= 1 && rating <= 5 && textoRaw === String(rating)) {
+            const emojis = { 1:"😞", 2:"😕", 3:"😐", 4:"🙂", 5:"😄" };
+            await db.collection("chats").doc(userPhone).set({
+                surveyPending:      false,
+                satisfactionRating: rating,
+                satisfactionAt:     admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+            await botResponder(userPhone,
+                `${emojis[rating]} ¡Gracias por tu valoración!\n\nTu calificación de *${rating}/5* ha sido registrada. Tu opinión nos ayuda a seguir mejorando. 🙏`
+            );
+            return;
+        }
+    }
+
     if (isGlobalPause && !(chatDocSnap.exists && chatDocSnap.data().humanMode)) {
         await db.collection("chats").doc(userPhone).set({ humanMode: true }, { merge: true });
     }
