@@ -352,29 +352,45 @@ async function procesarMensajeEntrante(message) {
     const isImgMsg     = ["imageMessage", "image"].includes(msgType);
     const isStickerMsg = msgType === "stickerMessage";
 
-    // Leer estado del chat PRIMERO para saber si es humanMode
-    // (necesario antes de decidir si subir imagen a Storage)
-    const [chatDocSnap, configSnap] = await Promise.all([
+    // Leer todo en paralelo: estado del chat, config, relay activo y perfiles de staff
+    const [chatDocSnap, configSnap, earlyRelaySnap, staffProfilesSnap] = await Promise.all([
         db.collection("chats").doc(userPhone).get(),
         db.collection("settings").doc("bot_config").get(),
+        db.collection("agent_relay").doc(userPhone).get(),
+        db.collection("user_profiles").get(),
     ]);
+
+    // ── SALIDA INMEDIATA: agente con relay activo — ANTES de cualquier escritura ──
+    if (earlyRelaySnap.exists && earlyRelaySnap.data().active) {
+        let imgBuf = null;
+        if (isImgMsg) {
+            try { imgBuf = await downloadMediaMessage(message, "buffer", {}, { logger: console, reuploadRequest: sock.updateMediaMessage }); } catch {}
+        }
+        await manejarRelayAgente(userPhone, message, earlyRelaySnap.data(), imgBuf);
+        return;
+    }
+
+    // ── Detectar staff (usando el snap ya cargado) ────────────────────────────────
+    const userPhone10 = userPhone.slice(-10);
+    const staffDoc    = staffProfilesSnap.docs.find(d => {
+        const raw = (d.data().phone || d.data().telefono || "").replace(/\D/g, "");
+        return raw.slice(-10) === userPhone10;
+    });
+    const isStaff    = !!staffDoc;
+    const staffMember = staffDoc ? { id: staffDoc.id, ...staffDoc.data() } : null;
+
     const isGlobalPause = configSnap.exists && configSnap.data().globalBotPaused === true;
     const isHumanMode   = (chatDocSnap.exists && chatDocSnap.data().humanMode === true) || isGlobalPause;
 
-    // Siempre descargar buffer de imagen para poder procesarla
-    // humanMode  → subir a chat/  y guardar mensaje con URL ahora
-    // bot mode   → NO guardar mensaje aún; procesarPago sube a pagos/ y guarda con esa URL
+    // Descargar imagen (necesario para procesarPago y humanMode upload)
     let imageBuffer = null;
     let imagePublicUrl = null;
     if (isImgMsg) {
         try {
             imageBuffer = await downloadMediaMessage(message, "buffer", {}, {
-                logger: console,
-                reuploadRequest: sock.updateMediaMessage,
+                logger: console, reuploadRequest: sock.updateMediaMessage,
             });
-        } catch (e) {
-            console.error("[IMG] Error descargando imagen:", e.message);
-        }
+        } catch (e) { console.error("[IMG] Error descargando imagen:", e.message); }
 
         if (isHumanMode && imageBuffer) {
             try {
@@ -384,13 +400,11 @@ async function procesarMensajeEntrante(message) {
                 await file.save(imageBuffer, { metadata: { contentType: "image/jpeg" } });
                 await file.makePublic();
                 imagePublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-            } catch (e) {
-                console.error("[IMG] Error subiendo imagen a chat/:", e.message);
-            }
+            } catch (e) { console.error("[IMG] Error subiendo imagen a chat/:", e.message); }
         }
     }
 
-    // Descargar y subir sticker a Storage para mostrarlo en el panel
+    // Descargar y subir sticker
     let stickerPublicUrl = null;
     if (isStickerMsg) {
         try {
@@ -405,25 +419,12 @@ async function procesarMensajeEntrante(message) {
                 await file.makePublic();
                 stickerPublicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
             }
-        } catch (e) {
-            console.error("[STICKER] Error descargando/subiendo sticker:", e.message);
-        }
+        } catch (e) { console.error("[STICKER] Error:", e.message); }
     }
 
-    // ── Salida temprana: si este número tiene relay activo es un agente respondiendo
-    // Se debe procesar ANTES de guardarMensajeChat para no crear chat con el número del agente
-    const earlyRelaySnap = await db.collection("agent_relay").doc(userPhone).get();
-    if (earlyRelaySnap.exists && earlyRelaySnap.data().active) {
-        await manejarRelayAgente(userPhone, message, earlyRelaySnap.data(), imageBuffer);
-        return;
-    }
-
-    // humanMode  → guardar mensaje ahora (con URL si se pudo subir)
-    // bot + img  → posponer; procesarPago guardará el mensaje con imageUrl de pagos/
-    // sticker    → guardar siempre con URL
-    // texto/otro → guardar ahora
+    // Staff nunca crea chat de cliente. Imágenes en bot-mode se posponen a procesarPago.
     const [, excusaSnap, cliente] = await Promise.all([
-        (isImgMsg && !isHumanMode)
+        (isStaff || (isImgMsg && !isHumanMode))
             ? Promise.resolve()
             : guardarMensajeChat(userPhone, message, "in", userName,
                 stickerPublicUrl ? { imageUrl: stickerPublicUrl, type: "stickerMessage" }
@@ -478,31 +479,9 @@ async function procesarMensajeEntrante(message) {
         await db.collection("chats").doc(userPhone).set({ humanMode: true }, { merge: true });
     }
 
-    // ── Detectar si es personal interno (admin / cobrador / tecnico) ──────────
-    // Traemos todos los perfiles de staff y comparamos normalizando los dígitos
-    // para no fallar por diferencias de formato (+57, espacios, 10 vs 12 dígitos).
-    const userPhone10 = userPhone.slice(-10); // últimos 10 dígitos del número entrante
-    const staffSnap = await db.collection("user_profiles")
-        .where("role", "in", ["admin", "cobrador", "tecnico"])
-        .get();
-    const staffDoc = staffSnap.docs.find(d => {
-        const data = d.data();
-        // Puede estar en el campo "phone" o "telefono"
-        const raw = (data.phone || data.telefono || "").replace(/\D/g, "");
-        // Coincide si los últimos 10 dígitos son iguales
-        return raw.slice(-10) === userPhone10;
-    });
-    const staffMember = staffDoc ? { id: staffDoc.id, ...staffDoc.data() } : null;
-    const isStaff = !!staffMember;
+    // isStaff / staffMember ya detectados al inicio con staffProfilesSnap
 
     if (isStaff) {
-        // ── Relay activo: el agente responde desde su WhatsApp al cliente ────────
-        const relaySnap = await db.collection("agent_relay").doc(userPhone).get();
-        if (relaySnap.exists && relaySnap.data().active) {
-            await manejarRelayAgente(userPhone, message, relaySnap.data(), imageBuffer);
-            return;
-        }
-
         const texto = (
             message.message?.conversation ||
             message.message?.extendedTextMessage?.text ||
@@ -569,6 +548,10 @@ async function procesarMensajeEntrante(message) {
 // LÓGICA DE NEGOCIO
 // ==========================================
 async function manejarClienteRegistrado(cliente, message, imageBuffer = null) {
+    // Guard: re-verificar humanMode para evitar race conditions
+    const chatSnap = await db.collection("chats").doc(cliente.telefono).get();
+    if (chatSnap.exists && chatSnap.data().humanMode === true) return;
+
     const msgType = Object.keys(message.message || {})[0];
 
     // ── Imagen → procesar comprobante de pago ──────────────────────────────────
