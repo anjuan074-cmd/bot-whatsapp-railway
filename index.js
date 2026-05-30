@@ -634,9 +634,10 @@ Responde SOLO con JSON válido sin texto adicional:
     switch (intent) {
 
         case "asesor": {
-            const agente      = await asignarAgenteOptimo();
-            const agentPhone  = agente ? normalizePhone(agente.phone || agente.telefono || "") : null;
-            await db.collection("chats").doc(cliente.telefono).set({
+            const agente       = await asignarAgenteOptimo();
+            const agentPhone   = agente ? normalizePhone(agente.phone || agente.telefono || "") : null;
+            const clientPhoneN = normalizePhone(cliente.telefono); // siempre 12 dígitos
+            await db.collection("chats").doc(clientPhoneN).set({
                 humanMode:   true,
                 assignedTo:  agente ? agente.displayName : null,
                 agentPhone:  agentPhone || null,
@@ -647,21 +648,19 @@ Responde SOLO con JSON válido sin texto adicional:
                 // Crear relay bidireccional + historial de auditoría
                 await Promise.all([
                     db.collection("agent_relay").doc(agentPhone).set({
-                        clientPhone: cliente.telefono,
+                        clientPhone: clientPhoneN,   // normalizado
                         clientName:  cliente.nombre,
                         agentName:   agente.displayName,
                         active:      true,
                         assignedAt:  admin.firestore.FieldValue.serverTimestamp(),
                     }),
-                    // Guardar quién atiende y cuándo en el chat
-                    db.collection("chats").doc(cliente.telefono).set({
+                    db.collection("chats").doc(clientPhoneN).set({
                         atendidoPor:   agente.displayName,
                         atendidoDesde: admin.firestore.FieldValue.serverTimestamp(),
                         atendidoHasta: null,
                     }, { merge: true }),
-                    // Nota interna visible en la app
-                    db.collection("chats").doc(cliente.telefono).collection("messages").add({
-                        text:      `👤 Conversación asignada a *${agente.displayName}* (carga actual: ${agente.carga} chats)`,
+                    db.collection("chats").doc(clientPhoneN).collection("messages").add({
+                        text:      `👤 Conversación asignada a *${agente.displayName}* (carga: ${agente.carga} chats)`,
                         role:      "note",
                         direction: "note",
                         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1255,7 +1254,8 @@ function calcularDeudaCliente(cliente) {
 // Devuelve el agente activo con menos chats abiertos en humanMode asignados
 // Maneja el relay WhatsApp agente ↔ cliente
 async function manejarRelayAgente(agentPhone, message, relayData, imageBuffer) {
-    const { clientPhone, clientName, agentName } = relayData;
+    const { clientName, agentName } = relayData;
+    const clientPhone = normalizePhone(relayData.clientPhone); // garantizar 12 dígitos
     const texto = (
         message.message?.conversation ||
         message.message?.extendedTextMessage?.text ||
